@@ -1,0 +1,261 @@
+diff --git a/config/macos26-recovery-root.json b/config/macos26-recovery-root.json
+index bf11c13..b445d1d 100644
+--- a/config/macos26-recovery-root.json
++++ b/config/macos26-recovery-root.json
+@@ -3,17 +3,17 @@
+   "variant": "recoveryos",
+   "window": "OS",
+   "bytes": 22737321984,
+-  "sha256": "2f91771a9b1034fa5f28a93c224b0912d57fcd2ca81b570e52ece3f8c3aff13f",
++  "sha256": "7391aa6246be0f675bb3e011433fc06562f94067631d37ab01faeb596f088044",
+   "volume_uuid": "47719f50-5527-44a3-9f59-8170528d8c14",
+   "isc": {
+     "window": "ISC",
+     "bytes": 2149580800,
+-    "sha256": "7c5d12ffdbd7fa602429df7b81679a1d4009349dd5ffd73970b9d811eab60390",
+-    "volume_uuid": "77cc1ec9-e861-449f-a511-2208a82e2929",
++    "sha256": "ed58ecaf09beecb345cdd2da80ecb5c89f4ec38d0660fe70237e06799c9e9f27",
++    "volume_uuid": "8903e675-15e9-4a2b-9149-99e645216f54",
+     "volumes": {
+-      "SHENG-xART": "77CC1EC9-E861-449F-A511-2208A82E2929",
+-      "SHENG-Preboot": "75BA3DFC-C2C0-4C81-9E6A-D179A08E2E73",
+-      "SHENG-Hardware": "CFE7C90C-94CB-41F0-9927-A81947B3513B"
++      "SHENG-xART": "8903E675-15E9-4A2B-9149-99E645216F54",
++      "SHENG-Preboot": "49DDAD26-078A-4B8D-9A15-668304BD60D8",
++      "SHENG-Hardware": "847D55B4-F302-4090-8EBB-EF36E86A7048"
+     },
+     "volatile_overlay_limit_bytes": 67108864,
+     "sep_trusted_storage": false
+diff --git a/config/macos26-recovery-ui-pages.full.json b/config/macos26-recovery-ui-pages.full.json
+index 4819aba..c164cdc 100644
+--- a/config/macos26-recovery-ui-pages.full.json
++++ b/config/macos26-recovery-ui-pages.full.json
+@@ -74,6 +74,24 @@
+           "after": "c0035fd6"
+         }
+       ]
++    },
++    {
++      "file": "Language Chooser",
++      "file_offset": 376832,
++      "before_sha256": "203804db0b02df6d610cc4ed9bc96937b66c820338d215f48ac4660cbab0afab",
++      "after_sha256": "f6c5345d5f6b98e0864826eba701c84df6d40871fd14abdd37e324ffbb6275da",
++      "edits": [
++        {
++          "offset": 3732,
++          "before": "a3340094",
++          "after": "000080d2"
++        },
++        {
++          "offset": 4164,
++          "before": "37340094",
++          "after": "000080d2"
++        }
++      ]
+     }
+   ]
+-}
+\ No newline at end of file
++}
+diff --git a/config/macos26-recovery-ui-pages.json b/config/macos26-recovery-ui-pages.json
+index 4819aba..c164cdc 100644
+--- a/config/macos26-recovery-ui-pages.json
++++ b/config/macos26-recovery-ui-pages.json
+@@ -74,6 +74,24 @@
+           "after": "c0035fd6"
+         }
+       ]
++    },
++    {
++      "file": "Language Chooser",
++      "file_offset": 376832,
++      "before_sha256": "203804db0b02df6d610cc4ed9bc96937b66c820338d215f48ac4660cbab0afab",
++      "after_sha256": "f6c5345d5f6b98e0864826eba701c84df6d40871fd14abdd37e324ffbb6275da",
++      "edits": [
++        {
++          "offset": 3732,
++          "before": "a3340094",
++          "after": "000080d2"
++        },
++        {
++          "offset": 4164,
++          "before": "37340094",
++          "after": "000080d2"
++        }
++      ]
+     }
+   ]
+-}
+\ No newline at end of file
++}
+diff --git a/platform/sheng/macos26/storage/recovery_root.h b/platform/sheng/macos26/storage/recovery_root.h
+index de9b31a..bac02df 100644
+--- a/platform/sheng/macos26/storage/recovery_root.h
++++ b/platform/sheng/macos26/storage/recovery_root.h
+@@ -15,6 +15,14 @@ static bool ufsRecoveryRootIdentity (const char *name, uint64_t bytes, const uin
+   static const uint8_t isc[32] = NATIVE_UFS_ISC_DIGEST;
+   if (!strcmp (name, "ISC") && bytes == NATIVE_UFS_ISC_BYTES)
+     return !memcmp (digest, isc, sizeof (isc));
++#endif
++#if defined(NATIVE_UFS_DRV_BYTES)
++  // uke: the DRV window is rewritten in place (dd from recovery), so its manifest digest is all zeros, never checked.
++  if (!strcmp (name, "DRV") && bytes == NATIVE_UFS_DRV_BYTES) {
++    uint8_t any = 0;
++    for (unsigned i = 0; i < 32; ++i) any |= digest[i];
++    return !any;
++  }
+ #endif
+   return false;
+ }
+@@ -34,6 +42,15 @@ static bool ufsRecoveryRootUuid (const char *name, uint64_t bytes, char out[37])
+     memcpy (out, isc, sizeof (isc));
+     return true;
+   }
++#endif
++#if defined(NATIVE_UFS_DRV_BYTES)
++  // Only for the distinct-identity check of the publisher; DRV publication never waits for this UUID.
++  static const char drv[] = NATIVE_UFS_DRV_UUID;
++  static_assert (sizeof (drv) == 37, "requires the DRV window UUID");
++  if (!strcmp (name, "DRV") && bytes == NATIVE_UFS_DRV_BYTES) {
++    memcpy (out, drv, sizeof (drv));
++    return true;
++  }
+ #endif
+   return false;
+ }
+diff --git a/scripts/build_macos26_storage.py b/scripts/build_macos26_storage.py
+index c49eb5f..4262d2b 100644
+--- a/scripts/build_macos26_storage.py
++++ b/scripts/build_macos26_storage.py
+@@ -3,6 +3,7 @@
+ """Build pinned native transports against the paired macOS storage headers."""
+ import hashlib
+ import json
++import os
+ from pathlib import Path
+ import plistlib
+ import subprocess
+@@ -71,6 +72,14 @@ def build(root, out, compile_record, source, run, record, env, *, transport='vir
+             recovery_prefix += (f'#define NATIVE_UFS_ISC_BYTES {isc["bytes"]}ULL\n'
+                 '#define NATIVE_UFS_ISC_DIGEST {' + ','.join(str(b) for b in isc_digest) + '}\n'
+                 f'#define NATIVE_UFS_ISC_UUID "{isc_uuid}"\n')
++        # uke: optional third window "DRV" (boot/macos-gpu/drv.json through UKE_DRV_CONFIG): the GPU plugin/Mesa volume
++        # and the raw GPU firmware table, read-only and never digest-checked (rewritten with dd from recovery).
++        if os.environ.get('UKE_DRV_CONFIG'):
++            drv = json.loads(Path(os.environ['UKE_DRV_CONFIG']).read_text())
++            if drv['window'] != 'DRV' or drv['bytes'] % (1 << 20) or not 0 < drv['bytes'] <= 2 << 30:
++                raise ValueError('requires the bounded DRV window contract')
++            recovery_prefix += (f'#define NATIVE_UFS_DRV_BYTES {drv["bytes"]}ULL\n'
++                                f'#define NATIVE_UFS_DRV_UUID "{str(uuid.UUID(drv["uuid"])).upper()}"\n')
+         recovery_prefix += f'#include "{root / "platform/sheng/macos26/storage/recovery_root.h"}"\n'
+         log = json.loads((root / 'config/macoslog.json').read_text())
+         validate_contract(log)
+@@ -121,7 +130,6 @@ def build(root, out, compile_record, source, run, record, env, *, transport='vir
+     run(command, directory + '-compile', record, cwd=Path(compile_record['directory']), env=env)
+     objects = [str(obj)]
+     # uke: the NT36532 touch panel as an absolute pointer (UKE_TOUCH_SRC = staged boot/macos-touch/src).
+-    import os
+     touch = os.environ.get('UKE_TOUCH_SRC') if transport == 'ufs' else None
+     if touch:
+         touch = Path(touch)
+@@ -154,6 +162,14 @@ def build(root, out, compile_record, source, run, record, env, *, transport='vir
+                 extra += ['-I', str(sdk / 'System/Library/Frameworks/Kernel.framework/Versions/A/Headers')]
+             run(extra, directory + '-touch-' + source.stem, record, cwd=Path(compile_record['directory']), env=env)
+             objects.append(str(out_obj))
++    # uke: the Adreno 732 bring-up (UKE_GPU_SRC = staged boot/macos-gpu/src; firmware mode in UKE_GPU_FIRMWARE).
++    gpu = os.environ.get('UKE_GPU_SRC') if transport == 'ufs' else None
++    if gpu:
++        import sys
++        sys.path.insert(0, str(Path(gpu).resolve().parent))
++        import uke_gpu_build
++        objects += uke_gpu_build.compile_objects(command, wrapper, obj, destination, run, record, compile_record,
++                                                 env, sdk, gpu)
+     if input_driver:
+         input_object = destination / 'recovery-input/NativeRecoveryInput.o'
+         input_command = [str(input_object) if arg == str(obj) else
+@@ -201,6 +217,8 @@ def build(root, out, compile_record, source, run, record, env, *, transport='vir
+             CFBundleIdentifier=bundle, IOClass='UkeTouchPointer', IOProviderClass='IOResources',
+             IOResourceMatch='IOKit', IOMatchCategory='UkeTouchPointer', IOProbeScore=500)
+         info['OSBundleLibraries']['com.apple.iokit.IOHIDFamily'] = '2.0.0'
++    if transport == 'ufs' and gpu:
++        info['IOKitPersonalities'].update(uke_gpu_build.personalities(bundle))
+     if display:
+         info['IOKitPersonalities']['NativeGOPDisplay'] = dict(
+             CFBundleIdentifier=bundle, IOClass='NativeGOPDisplay',
+diff --git a/scripts/build_macos26_xnu.py b/scripts/build_macos26_xnu.py
+index ce9dfd7..40fac68 100644
+--- a/scripts/build_macos26_xnu.py
++++ b/scripts/build_macos26_xnu.py
+@@ -96,6 +96,13 @@ PATCHES = [
+     ROOT / 'platform/sheng/macos26/patches/0070-uke-critical-nopanic.patch',
+     ROOT / 'platform/sheng/macos26/patches/0071-uke-smp-entry-trace.patch',
+     ROOT / 'platform/sheng/macos26/patches/0072-uke-smp-entry-faults.patch',
++    ROOT / 'platform/sheng/macos26/patches/0073-uke-user-stack-sample.patch',
++    ROOT / 'platform/sheng/macos26/patches/0074-uke-user-stack-sample-build.patch',
++    ROOT / 'platform/sheng/macos26/patches/0075-uke-user-stack-sample-names.patch',
++    ROOT / 'platform/sheng/macos26/patches/0076-uke-user-stack-sample-trace.patch',
++    ROOT / 'platform/sheng/macos26/patches/0077-uke-user-stack-sample-names-arg.patch',
++    ROOT / 'platform/sheng/macos26/patches/0078-uke-crash-report-names-arg.patch',
++    ROOT / 'platform/sheng/macos26/patches/0079-uke-boot-epoch.patch',
+ ]
+ MACHINE_PATCH = ROOT / 'platform/sheng/macos26/patches/machine-driver-declarations.patch'
+ CPU_PATCH = ROOT / 'platform/sheng/macos26/patches/machine-cpu-registration.patch'
+diff --git a/scripts/native_devtree.py b/scripts/native_devtree.py
+index 0f6c689..83d5b01 100644
+--- a/scripts/native_devtree.py
++++ b/scripts/native_devtree.py
+@@ -34,7 +34,8 @@ def configure_native_text_state(path: Path, *, development_root: bool = False,
+                                 platform_uuid: uuid.UUID | None = None,
+                                 qemu_disable_sleep: bool = False,
+                                 native_gop_display: bool = False,
+-                                qemu_virtio_input: bool = False) -> None:
++                                qemu_virtio_input: bool = False,
++                                sip0: int = 0) -> None:
+     data = path.read_bytes()
+     chosen = asmb = auth = options = proxies = 0
+     arm_io = gop_nodes = 0
+@@ -131,7 +132,7 @@ def configure_native_text_state(path: Path, *, development_root: bool = False,
+                 ensure('apfs-preboot-uuid', identity)
+         if development_root and location == ('device-tree', 'chosen', 'asmb'):
+             asmb += 1
+-            ensure('lp-sip0', struct.pack('<Q', 0))
++            ensure('lp-sip0', struct.pack('<Q', sip0))
+             ensure('lp-sip1', struct.pack('<I', 1))
+         descendants = bytearray()
+         for _ in range(children):
+@@ -167,7 +168,7 @@ def configure_native_text_state(path: Path, *, development_root: bool = False,
+             children += 1
+             gop_nodes += 1
+         if development_root and is_chosen and asmb == 0:
+-            entries = (('name', b'asmb\0'), ('lp-sip0', struct.pack('<Q', 0)),
++            entries = (('name', b'asmb\0'), ('lp-sip0', struct.pack('<Q', sip0)),
+                        ('lp-sip1', struct.pack('<I', 1)))
+             descendants.extend(struct.pack('<II', len(entries), 0))
+             for key, value in entries:
+diff --git a/scripts/native_storage_module.py b/scripts/native_storage_module.py
+index 122c882..28c8ba9 100644
+--- a/scripts/native_storage_module.py
++++ b/scripts/native_storage_module.py
+@@ -113,7 +113,7 @@ def prepare(directory: Path, base: int, native: dict, original: bytes,
+         display = evidence.get('native_gop_display')
+         input_driver = evidence.get('native_recovery_input')
+         allowed = {component, 'NativeGOPDisplay'} if display else {component}
+-        allowed |= {'UkeTouchPointer'}   # uke touch panel pointer
++        allowed |= {'UkeTouchPointer', 'UkeGpu'}   # uke touch panel pointer, Adreno 732 bring-up
+         if input_driver:
+             allowed |= {'NativeRecoveryInput', 'IOHIDEventDriver'}
+         if info['CFBundleExecutable'] != component or any(
+diff --git a/scripts/prepare_macos26_gop.py b/scripts/prepare_macos26_gop.py
+index ef3c4dd..55475e9 100644
+--- a/scripts/prepare_macos26_gop.py
++++ b/scripts/prepare_macos26_gop.py
+@@ -50,8 +50,7 @@ def prepare(root: Path, destination: Path) -> dict:
+     source = destination / 'NativeGOPDisplay.cpp'
+     (destination / 'DroidVMDisplay.cpp').replace(source)
+     # uke: optional half-resolution mode (native-gop-scale=2) on top of the paired adaptation.
+-    uke = root / 'platform/sheng/macos26/display/0002-uke-gop-scale.patch'
+-    if uke.exists():
++    for uke in sorted((root / 'platform/sheng/macos26/display').glob('000[2-9]-uke-*.patch')):
+         subprocess.run(['patch', '--batch', '--fuzz=0', '-p1', '-i', str(uke.resolve())],
+                        cwd=destination, check=True, capture_output=True, text=True)
+     scanout = root / 'platform/sheng/macos26/display/gop_scanout.h'

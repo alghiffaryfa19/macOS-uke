@@ -1,0 +1,186 @@
+diff --git a/drivers/Adreno740/NativeAdrenoCpu.cpp b/drivers/Adreno740/NativeAdrenoCpu.cpp
+index 268520c..c218f1e 100644
+--- a/drivers/Adreno740/NativeAdrenoCpu.cpp
++++ b/drivers/Adreno740/NativeAdrenoCpu.cpp
+@@ -20,6 +20,9 @@ void NativeAdrenoNotePhase(unsigned phase,size_t bytes)
+     __atomic_fetch_add(&native_adreno_maint_phase[phase&7][0],1,__ATOMIC_RELAXED);
+     __atomic_fetch_add(&native_adreno_maint_phase[phase&7][1],(bytes+1023)>>10,__ATOMIC_RELAXED);
+ }
++size_t NativeAdrenoCpuPageBytes() {return page_size;}
++/* The pmap's page number of a physical address: units of the kernel page (pa >> PAGE_SHIFT, 14 on macOS), not of 4 KiB. */
++static inline ppnum_t cpuPage(uint64_t physical) {return (ppnum_t)(physical/page_size);}
+ bool NativeAdrenoPagesUncached(const NativeAdrenoPhysicalSpan *spans,size_t count)
+ {
+     if(!spans || !count)return false;
+@@ -29,7 +32,7 @@ bool NativeAdrenoPagesUncached(const NativeAdrenoPhysicalSpan *spans,size_t coun
+             /* Outside the kernel's DRAM (device memory such as the firmware framebuffer): never cached. */
+             if(page<gPhysBase || page-gPhysBase>=gPhysSize)continue;
+             /* Write-combined, device, posted and real-time attributes all carry VM_MEM_NOT_CACHEABLE; write-through does not. */
+-            if(!(pmap_cache_attributes((ppnum_t)(page>>12))&VM_MEM_NOT_CACHEABLE))return false;
++            if(!(pmap_cache_attributes(cpuPage(page))&VM_MEM_NOT_CACHEABLE))return false;
+         }
+     return true;
+ }
+@@ -55,8 +58,11 @@ IOReturn NativeAdrenoQueryCpu4K(NativeAdrenoCpuState *out)
+     out->kernel_page_bytes=page_size;
+     out->kernel_map_page_bytes=vm_map_page_size(kernel_map);
+     enable_preemption();
+-    bool native=PAGE_SIZE==4096 && out->kernel_page_bytes==4096 && out->kernel_map_page_bytes==4096 &&
+-        ((out->tcr>>14)&3)==0 && ((out->tcr>>30)&3)==2 &&
++    /* The kernel's granule: 4 KiB (TG0 0, TG1 2) on iPadOS, 16 KiB (TG0 2, TG1 1) on macOS. The driver's own memory is 4 KiB-addressed
++     * for the GPU either way; what depends on the CPU page goes through NativeAdrenoCpuPageBytes. */
++    const unsigned tg0=(unsigned)((out->tcr>>14)&3),tg1=(unsigned)((out->tcr>>30)&3);
++    const bool granule=out->kernel_page_bytes==4096?(tg0==0 && tg1==2):out->kernel_page_bytes==16384?(tg0==2 && tg1==1):false;
++    bool native=out->kernel_page_bytes==page_size && out->kernel_map_page_bytes==page_size && granule &&
+         (out->sctlr&1) && (out->ttbr1&UINT64_C(0x0000fffffffff000));
+     return native?kIOReturnSuccess:kIOReturnUnsupported;
+ }
+@@ -144,9 +150,17 @@ IOReturn NativeAdrenoSetPagesCacheMode(const NativeAdrenoPhysicalSpan *spans,siz
+             span.physical<gPhysBase || span.physical+span.bytes-gPhysBase>gPhysSize)return kIOReturnBadArgument;
+         pages+=span.bytes/4096;
+     }
++    /* Every kernel page the spans touch, once: on a 16 KiB kernel four 4 KiB pieces of a span share one attribute. The caller owns the whole
++     * page (NativeAdrenoMemory allocates whole kernel pages). */
++    ppnum_t last=0;
++    bool any=false;
+     for(size_t i=0;i<count;++i)
+-        for(uint64_t offset=0;offset<spans[i].bytes;offset+=4096)
+-            pmap_set_cache_attributes((ppnum_t)((spans[i].physical+offset)>>12),write_combined?VM_WIMG_WCOMB:VM_WIMG_USE_DEFAULT);
++        for(uint64_t page=spans[i].physical&~(uint64_t)(page_size-1);page<spans[i].physical+spans[i].bytes;page+=page_size) {
++            const ppnum_t pn=cpuPage(page);
++            if(any && pn==last)continue;
++            any=true;last=pn;
++            pmap_set_cache_attributes(pn,write_combined?VM_WIMG_WCOMB:VM_WIMG_USE_DEFAULT);
++        }
+     if(write_combined)__atomic_fetch_add(&native_adreno_cache_stats[4],pages,__ATOMIC_RELAXED);
+     else __atomic_fetch_sub(&native_adreno_cache_stats[4],pages,__ATOMIC_RELAXED);
+     return kIOReturnSuccess;
+@@ -159,8 +173,8 @@ IOReturn NativeAdrenoReassertWriteCombined(const NativeAdrenoPhysicalSpan *spans
+         const NativeAdrenoPhysicalSpan &span=spans[i];
+         if(!span.bytes || ((span.physical|span.bytes)&4095) || span.physical>UINT64_MAX-span.bytes ||
+             span.physical<gPhysBase || span.physical+span.bytes-gPhysBase>gPhysSize)return kIOReturnBadArgument;
+-        for(uint64_t offset=0;offset<span.bytes;offset+=4096) {
+-            const ppnum_t pn=(ppnum_t)((span.physical+offset)>>12);
++        for(uint64_t page=span.physical&~(uint64_t)(page_size-1);page<span.physical+span.bytes;page+=page_size) {
++            const ppnum_t pn=cpuPage(page);
+             /* From the default attribute the pmap also cleans and invalidates the page (pmap_sync_wimg), so lines a cacheable view
+              * dirtied reach DRAM before the GPU reads it. */
+             if((pmap_cache_attributes(pn)&VM_WIMG_MASK)!=VM_WIMG_WCOMB) {pmap_set_cache_attributes(pn,VM_WIMG_WCOMB);++*reset;}
+diff --git a/drivers/Adreno740/NativeAdrenoMemory.cpp b/drivers/Adreno740/NativeAdrenoMemory.cpp
+index d47f08d..d25b49e 100644
+--- a/drivers/Adreno740/NativeAdrenoMemory.cpp
++++ b/drivers/Adreno740/NativeAdrenoMemory.cpp
+@@ -90,18 +90,20 @@ IOReturn NativeAdrenoMemory::allocate(size_t bytes,unsigned bits,bool contiguous
+     uint64_t limit=UINT64_C(1)<<bits;
+     IOOptionBits options=static_cast<IOOptionBits>(kIODirectionInOut)|static_cast<IOOptionBits>(kIOMemoryMapperNone);
+     if(contiguous)options|=kIOMemoryPhysicallyContiguous;
+-    descriptor_=IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,options,bytes,(limit-1)&~UINT64_C(4095));
++    /* Whole kernel pages, aligned to them (the mask's low zero bits are the alignment): makeWriteCombined changes their attribute. */
++    const size_t whole=NativeAdrenoRoundCpuPage(bytes);
++    descriptor_=IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,options,whole,(limit-1)&~(uint64_t)(NativeAdrenoCpuPageBytes()-1));
+     if(!descriptor_)return kIOReturnNoMemory;
+     status=descriptor_->prepare();
+     if(status!=kIOReturnSuccess) {descriptor_->release();descriptor_=nullptr;return status;}
+     prepared_=true;bytes_=bytes;mapping_=descriptor_->getBytesNoCopy();
+     status=kIOReturnUnsupported;
+     if(!mapping_ || ((uintptr_t)mapping_&4095) || bytes>UINTPTR_MAX-(uintptr_t)mapping_ ||
+-        descriptor_->getLength()!=bytes)goto failed;
++        descriptor_->getLength()!=whole)goto failed;
+     status=takeSegments(descriptor_,bytes,limit,contiguous);
+     if(status!=kIOReturnSuccess)goto failed;
+-    bzero(mapping_,bytes);
+-    status=NativeAdrenoMaintainOwnedPages(mapping_,bytes,NativeAdrenoClean);
++    bzero(mapping_,whole);
++    status=NativeAdrenoMaintainOwnedPages(mapping_,whole,NativeAdrenoClean);
+     if(status!=kIOReturnSuccess)goto failed;
+     NativeAdrenoNotePhase(NativeAdrenoPhaseAllocate,bytes);
+     noteOwned(spans_,span_count_,true);owned_=true;
+@@ -136,14 +138,16 @@ static IOBufferMemoryDescriptor *systemDescriptor(size_t bytes,bool write_combin
+     if(failedBytes && now-failedAt>=backoff)failedBytes=0;
+     if(contigKiB && bytes>=size_t(contigKiB)*1024 && bytes<=contigMax && !(failedBytes && bytes>=failedBytes)) {
+         IOBufferMemoryDescriptor *run=IOBufferMemoryDescriptor::inTaskWithPhysicalMask(nullptr,
+-            (options&~static_cast<IOOptionBits>(kIOMemoryPageable))|static_cast<IOOptionBits>(kIOMemoryPhysicallyContiguous),bytes,UINT64_C(0xfffffffff000));
++            (options&~static_cast<IOOptionBits>(kIOMemoryPageable))|static_cast<IOOptionBits>(kIOMemoryPhysicallyContiguous),
++            NativeAdrenoRoundCpuPage(bytes),UINT64_C(0xfffffffff000)&~(uint64_t)(NativeAdrenoCpuPageBytes()-1));
+         if(run && run->prepare()==kIOReturnSuccess) {native_adreno_bo_contig[0]=native_adreno_bo_contig[0]+1;return run;}
+         if(run)run->release();
+         native_adreno_bo_contig[1]=native_adreno_bo_contig[1]+1;
+         if(!failedBytes || bytes<failedBytes)failedBytes=bytes;
+         failedAt=now;
+     }
+-    IOBufferMemoryDescriptor *descriptor=IOBufferMemoryDescriptor::inTaskWithOptions(nullptr,options,bytes,4096);
++    IOBufferMemoryDescriptor *descriptor=IOBufferMemoryDescriptor::inTaskWithOptions(nullptr,options,NativeAdrenoRoundCpuPage(bytes),
++        NativeAdrenoCpuPageBytes());
+     if(made)*made=mach_absolute_time();
+     if(descriptor && descriptor->prepare()!=kIOReturnSuccess) {descriptor->release();descriptor=nullptr;}
+     if(wired)*wired=mach_absolute_time();
+@@ -156,7 +160,7 @@ IOReturn NativeAdrenoMemory::prepareSystem(size_t bytes,bool write_combined,Nati
+     IOBufferMemoryDescriptor *descriptor=systemDescriptor(bytes,write_combined,&made,&wired);
+     if(!descriptor)return kIOReturnNoMemory;
+     if(!made)made=wired=mach_absolute_time();   /* a contiguous run: made and wired in one step */
+-    if(descriptor->getLength()!=bytes) {descriptor->complete();descriptor->release();return kIOReturnUnsupported;}
++    if(descriptor->getLength()!=NativeAdrenoRoundCpuPage(bytes)) {descriptor->complete();descriptor->release();return kIOReturnUnsupported;}
+     bool cleaned=false;
+     /* Default-attribute pages may still hold the zero fill in a CPU's cache: written back here, by physical runs, as allocateSystem would. */
+     if(!write_combined) {
+@@ -196,7 +200,7 @@ IOReturn NativeAdrenoMemory::allocateSystem(size_t bytes,unsigned bits,size_t bu
+     status=descriptor_?kIOReturnSuccess:kIOReturnNoMemory;
+     if(status==kIOReturnSuccess) {
+         system_=true;prepared_=true;bytes_=bytes;write_combined_=write_combined;noteSystem((int64_t)bytes);
+-        status=descriptor_->getLength()==bytes?takeSegments(descriptor_,bytes,UINT64_C(1)<<bits,false):kIOReturnUnsupported;
++        status=descriptor_->getLength()==NativeAdrenoRoundCpuPage(bytes)?takeSegments(descriptor_,bytes,UINT64_C(1)<<bits,false):kIOReturnUnsupported;
+         /* Default-attribute pages may still hold the zero fill in this CPU's cache: written back before the GPU reads them. */
+         if(status==kIOReturnSuccess && !write_combined && !cleaned) {
+             status=maintainImported(0,bytes,NativeAdrenoClean);
+@@ -335,7 +339,7 @@ IOReturn NativeAdrenoMemory::release()
+          * of system memory maps its VM object, which keeps the pages until the view goes. */
+         for(size_t i=0;i<span_count_ && i<64;++i) {
+             char name[17]={};void *pmap=nullptr;uint64_t va=0;
+-            if(native_pmap_user_mappings((ppnum_t)(spans_[i].physical>>12),&pmap,&va,name)) {
++            if(native_pmap_user_mappings((ppnum_t)(spans_[i].physical/NativeAdrenoCpuPageBytes()),&pmap,&va,name)) {
+                 native_adreno_free_user_mapped[0]=native_adreno_free_user_mapped[0]+1;
+                 native_adreno_free_user_mapped[1]=(uint32_t)(va>>12);
+                 break;
+diff --git a/drivers/Adreno740/NativeAdrenoMemory.h b/drivers/Adreno740/NativeAdrenoMemory.h
+index ce577c7..ed76967 100644
+--- a/drivers/Adreno740/NativeAdrenoMemory.h
++++ b/drivers/Adreno740/NativeAdrenoMemory.h
+@@ -16,6 +16,11 @@ struct NativeAdrenoCpuState {
+     uint64_t kernel_page_bytes,kernel_map_page_bytes;
+ };
+ IOReturn NativeAdrenoQueryCpu4K(NativeAdrenoCpuState *);
++/* The kernel's page (page_size: 4 KiB on iPadOS, 16 KiB on macOS). The pmap's page numbers and cache attributes are per kernel page; the
++ * GPU's SMMU still maps 4 KiB pages. Memory whose CPU attribute this driver changes is allocated in whole kernel pages, so an attribute
++ * change never reaches a neighbour's memory in the same page. */
++size_t NativeAdrenoCpuPageBytes();
++inline size_t NativeAdrenoRoundCpuPage(size_t bytes) {const size_t page=NativeAdrenoCpuPageBytes();return (bytes+page-1)&~(page-1);}
+ enum NativeAdrenoCacheOperation {NativeAdrenoClean,NativeAdrenoCleanInvalidate,NativeAdrenoInvalidate};
+ IOReturn NativeAdrenoMaintainOwnedPages(void *,size_t,NativeAdrenoCacheOperation);
+ /* The same over whole physical pages of DRAM, through the kernel's physical aperture: data cache lines are physically tagged, so this
+diff --git a/drivers/Adreno740/NativeAdrenoPublish.cpp b/drivers/Adreno740/NativeAdrenoPublish.cpp
+index 3d179d8..833ec25 100644
+--- a/drivers/Adreno740/NativeAdrenoPublish.cpp
++++ b/drivers/Adreno740/NativeAdrenoPublish.cpp
+@@ -376,7 +376,8 @@ bool AGXDeviceUserClient::mount(bool kernel)
+     /* The mailbox page and its poller serve the render server's connection only. */
+     if(ok && server && row_==0) {
+         if(!gMailbox) {
+-            gMailbox=IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,kIODirectionInOut,4096,4096);
++            /* A whole kernel page: a smaller kernel buffer can share its page with other kernel data, and the client view maps whole pages. */
++            gMailbox=IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,kIODirectionInOut,NativeAdrenoCpuPageBytes(),NativeAdrenoCpuPageBytes());
+             if(gMailbox) {gMailboxWords=static_cast<volatile uint32_t *>(gMailbox->getBytesNoCopy());memset(const_cast<uint32_t *>(gMailboxWords),0,4096);}
+         }
+         if(gMailboxWords) {
+diff --git a/package/GpuPowerProbe.cpp b/package/GpuPowerProbe.cpp
+index ea3067c..72afeac 100644
+--- a/package/GpuPowerProbe.cpp
++++ b/package/GpuPowerProbe.cpp
+@@ -495,7 +495,7 @@ int lineAudit(uint64_t pa, size_t bytes, uint32_t *dirty, uint32_t *stale) {
+         bool written = true;
+         for (unsigned i = 0; i < 8; ++i) if (d[i] != copy[i]) written = false;
+         if (written) {
+-            if (!*dirty && !native_adreno_audit_attr) native_adreno_audit_attr = 0x100 | (pmap_cache_attributes(unsigned(pa >> 12)) & 0xff);
++            if (!*dirty && !native_adreno_audit_attr) native_adreno_audit_attr = 0x100 | (pmap_cache_attributes(unsigned(pa / NativeAdrenoCpuPageBytes())) & 0xff);
+             ++*dirty;
+         } else {
+             ++*stale;

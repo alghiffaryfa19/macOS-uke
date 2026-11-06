@@ -1,0 +1,36 @@
+--- a/osfmk/kern/bsd_kern.c
++++ b/osfmk/kern/bsd_kern.c
+@@ -1606,6 +1606,7 @@
+ static void
+ uke_sample_tick(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+ {
++	printf("UKE-SAMPLE: tick pid %d round %u\n", uke_sample_pid, uke_sample_rounds);
+ 	void *p = proc_find(uke_sample_pid);
+ 	if (!p) {
+ 		printf("UKE-SAMPLE: pid %d gone\n", uke_sample_pid);
+@@ -1625,17 +1626,23 @@
+ uke_sample_exec(const char *comm, int pid)
+ {
+ 	unsigned enabled = 0;
+-	if (strcmp(comm, "Language Chooser") || !PE_parse_boot_argn("uke-sample", &enabled, sizeof(enabled)) || !enabled) {
++	if (strcmp(comm, "Language Chooser")) {
+ 		return;
+ 	}
++	bool found = PE_parse_boot_argn("uke-sample", &enabled, sizeof(enabled));
++	printf("UKE-SAMPLE: exec match %s pid %d boot-arg %d value %u\n", comm, pid, found, enabled);
++	if (!found || !enabled) {
++		return;
++	}
+ 	if (!uke_sample_call) {
+-		uke_sample_call = thread_call_allocate_with_options(uke_sample_tick, NULL, THREAD_CALL_PRIORITY_LOW, 0);
++		uke_sample_call = thread_call_allocate_with_options(uke_sample_tick, NULL, THREAD_CALL_PRIORITY_KERNEL, 0);
+ 		if (!uke_sample_call) {
+ 			return;
+ 		}
+ 	}
+ 	uke_sample_pid = pid;
+ 	uke_sample_rounds = 0;
++	printf("UKE-SAMPLE: armed for %s pid %d\n", comm, pid);
+ 	uint64_t deadline;
+ 	nanoseconds_to_absolutetime(20ULL * NSEC_PER_SEC, &deadline);
+ 	thread_call_enter_delayed(uke_sample_call, mach_absolute_time() + deadline);

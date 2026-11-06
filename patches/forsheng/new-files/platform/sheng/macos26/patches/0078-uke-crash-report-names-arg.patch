@@ -1,0 +1,42 @@
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -2152,8 +2152,29 @@
+ 					}
+ 				}
+ 			}
++		}
++	}
++}
++/* uke: extra process names to report, comma separated (boot-arg uke-crash-name=cryptexd,apsd). */
++static bool
++uke_crash_named(const char *comm)
++{
++	char list[128] = "";
++	if (!PE_parse_boot_argn("uke-crash-name", list, sizeof(list))) {
++		return false;
++	}
++	size_t n = strnlen(comm, MAXCOMLEN + 1);
++	for (char *s = list; *s;) {
++		char *e = s;
++		while (*e && *e != ',') {
++			e++;
+ 		}
++		if ((size_t)(e - s) == n && !strncmp(s, comm, n)) {
++			return true;
++		}
++		s = *e ? e + 1 : e;
+ 	}
++	return false;
+ }
+ #endif
+ 
+@@ -2161,7 +2182,8 @@
+ proc_prepareexit(proc_t p, int rv, boolean_t perf_notify)
+ {
+ #if SHENG
+-	if (!strncmp(p->p_comm, "WindowServer", sizeof(p->p_comm)) || !strncmp(p->p_comm, "loginwindow", sizeof(p->p_comm))) {
++	if (!strncmp(p->p_comm, "WindowServer", sizeof(p->p_comm)) || !strncmp(p->p_comm, "loginwindow", sizeof(p->p_comm)) ||
++	    uke_crash_named(p->p_comm)) {
+ 		uke_windowserver_report(p, rv);
+ 	}
+ #endif

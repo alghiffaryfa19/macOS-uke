@@ -1,0 +1,121 @@
+diff --git a/NativeUfs.cpp b/NativeUfs.cpp
+--- a/NativeUfs.cpp
++++ b/NativeUfs.cpp
+@@ -1242,6 +1242,9 @@
+ #endif
+   const char *windowLabel () const { return label; }
+   bool configure (const char *name, uint64_t absoluteOffset, uint64_t size);
++#if defined(NATIVE_UFS_DRV_BYTES)
++  IOReturn readRaw (uint64_t offset, void *out, uint32_t length);
++#endif
+   bool start (IOService *provider) override;
+   void free () override;
+   IOReturn doEjectMedia () override { return kIOReturnUnsupported; }
+@@ -1272,6 +1275,9 @@
+   IOReturn doAsyncReadWrite (IOMemoryDescriptor *, UInt64, UInt64, IOStorageAttributes *, IOStorageCompletion *) override;
+ };
+ OSDefineMetaClassAndStructors (NativeUfsBlock, IOBlockStorageDevice)
++#if defined(NATIVE_UFS_DRV_BYTES)
++static NativeUfsBlock *gDrvWindow;
++#endif
+ 
+ extern "C" {
+ volatile uint32_t native_ufs_blocks_published = 0;
+@@ -1323,6 +1329,10 @@
+   strlcpy (label, name, sizeof (label));
+   absolute = absoluteOffset;
+   bytes = size;
++#if defined(NATIVE_UFS_DRV_BYTES)
++  // uke: the DRV window has no overlay (read-only, rewritten with dd from recovery); UkeGpu reads raw firmware from it.
++  if (!strcmp (label, "DRV")) gDrvWindow = this;
++#endif
+ #if defined(NATIVE_UFS_RECOVERY_ROOT) && NATIVE_UFS_RECOVERY_ROOT
+   uint32_t requested = 0;
+   uint32_t osOverlayMiB = 0;
+@@ -1519,8 +1529,34 @@
+   online = true;
+   registerService ();
+   return true;
++}
++
++#if defined(NATIVE_UFS_DRV_BYTES)
++// uke: raw reads of the DRV window outside IOStorage (the GPU firmware table sits in its GPT gap, before the volume).
++IOReturn NativeUfsBlock::readRaw (uint64_t offset, void *out, uint32_t length)
++{
++  if (!online) return kIOReturnNotReady;
++  if (!out || !length || ((offset | length) & 4095) || offset >= bytes || length > bytes - offset)
++    return kIOReturnBadArgument;
++  IOReturn result = kIOReturnSuccess;
++  IOLockLock (windowLock);
++  for (uint32_t done = 0; done < length && result == kIOReturnSuccess;) {
++    uint32_t chunk = length - done < kDataMax ? length - done : kDataMax;
++    result = hostRead4k (0, (absolute + offset + done) / 4096, chunk / 4096, bounce);
++    if (result == kIOReturnSuccess) memcpy (static_cast<uint8_t *> (out) + done, bounce, chunk);
++    done += chunk;
++  }
++  IOLockUnlock (windowLock);
++  return result;
+ }
+ 
++extern "C" IOReturn native_ufs_drv_read (uint64_t offset, void *out, uint32_t length)
++{
++  NativeUfsBlock *window = gDrvWindow;
++  return window ? window->readRaw (offset, out, length) : kIOReturnNotReady;
++}
++#endif
++
+ IOReturn NativeUfsBlock::doAsyncReadWrite (IOMemoryDescriptor *buffer, UInt64 block, UInt64 count,
+                                            IOStorageAttributes *, IOStorageCompletion *completion)
+ {
+@@ -1738,6 +1774,10 @@
+     bool wait (unsigned index) {
+       NativeUfsBlock *device = gPendingDevice[index];
+       const char *uuid = gPendingUuid[index];
++#if defined(NATIVE_UFS_DRV_BYTES)
++      // uke: DRV is a plain data disk that may be blank or being rewritten; never hold the root mount on it.
++      if (!strcmp (device->windowLabel (), "DRV")) return true;
++#endif
+       gRootDiagnostic.stage = "media publication";
+       gRootDiagnostic.publicationPhase = static_cast<unsigned> (UfsRootPhase::Media);
+       gRootDiagnostic.publicationWindow = index;
+@@ -1999,7 +2039,11 @@
+   gStoreGeometry = { true, layout->userdataFirst, layout->userdataLast, layout->imageBytes, layout->gptEntriesLba,
+                      layout->gptHeaderCrc, layout->gptEntriesCrc, layout->gptEntryCount };
+ #if defined(NATIVE_UFS_RECOVERY_ROOT) && NATIVE_UFS_RECOVERY_ROOT
++#if defined(NATIVE_UFS_DRV_BYTES)
++  bool paired = layout->windows >= 1 && layout->windows <= 3;   // uke: OS, ISC and the optional DRV
++#else
+   bool paired = layout->windows >= 1 && layout->windows <= 2;
++#endif
+   for (unsigned i = 0; paired && i < layout->windows; ++i)
+     paired = ufsRecoveryRootIdentity (layout->window[i].name, layout->window[i].size, layout->window[i].sha256);
+   if (!paired) {
+diff --git a/RootPublication.h b/RootPublication.h
+--- a/RootPublication.h
++++ b/RootPublication.h
+@@ -12,6 +12,25 @@
+     plan.count = 1;
+     return true;
+   }
++#if defined(NATIVE_UFS_DRV_BYTES)
++  // uke: an optional third window "DRV" (GPU plugin, Mesa, firmware), published after ISC and before OS so the root
++  // mount never waits on it; its media wait is skipped (publishThread).
++  if (count == 3) {
++    unsigned os = 3, isc = 3, drv = 3;
++    for (unsigned i = 0; i < 3; ++i) {
++      if (!names[i]) return false;
++      if (!strcmp (names[i], "OS")) os = i;
++      else if (!strcmp (names[i], "ISC")) isc = i;
++      else if (!strcmp (names[i], "DRV")) drv = i;
++    }
++    if (os == 3 || isc == 3 || drv == 3) return false;
++    plan.count = 3;
++    plan.order[0] = isc;
++    plan.order[1] = drv;
++    plan.order[2] = os;
++    return true;
++  }
++#endif
+   if (count != 2 || !names[0] || !names[1]) return false;
+   unsigned recoveryOs = !strcmp (names[0], "OS") ? 0 : 1;
+   unsigned isc = 1 - recoveryOs;

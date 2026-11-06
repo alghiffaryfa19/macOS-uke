@@ -1,0 +1,7 @@
+UniXNU fb6aad6ab1f50199a4d99d2da1d0ca403b067633
+drivers/ArmCpu 1951cc8444b340d7d8879e9418220cf29eb711d7 https://github.com/UniXNU/ArmCpu.git
+drivers/DarwinBoot d099354d0eab34df5088ca1ba89c9c88bc3260bb https://github.com/UniXNU/DarwinBoot.git
+drivers/NativeRamBlock d4d22d9819b0162eda49f6402235dddc2279410d https://github.com/UniXNU/NativeRamBlock.git
+drivers/NativeUfs af785c1777161a62931425c2faaa536ce0bebd5b https://github.com/UniXNU/NativeUfs.git
+drivers/NativeVirtioBlock 98909eb9198a4360d7a43be831887cb8b74d814d https://github.com/UniXNU/NativeVirtioBlock.git
+kits/VerifiedRoot 2854c61f6c4dfda870ac3d93e1f03d9181edb041 https://github.com/UniXNU/VerifiedRoot.git

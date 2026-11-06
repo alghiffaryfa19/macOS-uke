@@ -1,0 +1,104 @@
+Only in fb/scripts: __pycache__
+diff --git a/scripts/build_macos26_storage.py b/scripts/build_macos26_storage.py
+--- a/scripts/build_macos26_storage.py	2026-11-02 21:52:50
++++ b/scripts/build_macos26_storage.py	2026-11-02 21:53:40
+@@ -3,6 +3,7 @@
+ """Build pinned native transports against the paired macOS storage headers."""
+ import hashlib
+ import json
++import os
+ from pathlib import Path
+ import plistlib
+ import subprocess
+@@ -71,6 +72,14 @@
+             recovery_prefix += (f'#define NATIVE_UFS_ISC_BYTES {isc["bytes"]}ULL\n'
+                 '#define NATIVE_UFS_ISC_DIGEST {' + ','.join(str(b) for b in isc_digest) + '}\n'
+                 f'#define NATIVE_UFS_ISC_UUID "{isc_uuid}"\n')
++        # uke: optional third window "DRV" (boot/macos-gpu/drv.json through UKE_DRV_CONFIG): the GPU plugin/Mesa volume
++        # and the raw GPU firmware table, read-only and never digest-checked (rewritten with dd from recovery).
++        if os.environ.get('UKE_DRV_CONFIG'):
++            drv = json.loads(Path(os.environ['UKE_DRV_CONFIG']).read_text())
++            if drv['window'] != 'DRV' or drv['bytes'] % (1 << 20) or not 0 < drv['bytes'] <= 2 << 30:
++                raise ValueError('requires the bounded DRV window contract')
++            recovery_prefix += (f'#define NATIVE_UFS_DRV_BYTES {drv["bytes"]}ULL\n'
++                                f'#define NATIVE_UFS_DRV_UUID "{str(uuid.UUID(drv["uuid"])).upper()}"\n')
+         recovery_prefix += f'#include "{root / "platform/sheng/macos26/storage/recovery_root.h"}"\n'
+         log = json.loads((root / 'config/macoslog.json').read_text())
+         validate_contract(log)
+@@ -121,7 +130,6 @@
+     run(command, directory + '-compile', record, cwd=Path(compile_record['directory']), env=env)
+     objects = [str(obj)]
+     # uke: the NT36532 touch panel as an absolute pointer (UKE_TOUCH_SRC = staged boot/macos-touch/src).
+-    import os
+     touch = os.environ.get('UKE_TOUCH_SRC') if transport == 'ufs' else None
+     if touch:
+         touch = Path(touch)
+@@ -154,6 +162,14 @@
+                 extra += ['-I', str(sdk / 'System/Library/Frameworks/Kernel.framework/Versions/A/Headers')]
+             run(extra, directory + '-touch-' + source.stem, record, cwd=Path(compile_record['directory']), env=env)
+             objects.append(str(out_obj))
++    # uke: the Adreno 732 bring-up (UKE_GPU_SRC = staged boot/macos-gpu/src; firmware mode in UKE_GPU_FIRMWARE).
++    gpu = os.environ.get('UKE_GPU_SRC') if transport == 'ufs' else None
++    if gpu:
++        import sys
++        sys.path.insert(0, str(Path(gpu).resolve().parent))
++        import uke_gpu_build
++        objects += uke_gpu_build.compile_objects(command, wrapper, obj, destination, run, record, compile_record,
++                                                 env, sdk, gpu)
+     if input_driver:
+         input_object = destination / 'recovery-input/NativeRecoveryInput.o'
+         input_command = [str(input_object) if arg == str(obj) else
+@@ -201,6 +217,8 @@
+             CFBundleIdentifier=bundle, IOClass='UkeTouchPointer', IOProviderClass='IOResources',
+             IOResourceMatch='IOKit', IOMatchCategory='UkeTouchPointer', IOProbeScore=500)
+         info['OSBundleLibraries']['com.apple.iokit.IOHIDFamily'] = '2.0.0'
++    if transport == 'ufs' and gpu:
++        info['IOKitPersonalities'].update(uke_gpu_build.personalities(bundle))
+     if display:
+         info['IOKitPersonalities']['NativeGOPDisplay'] = dict(
+             CFBundleIdentifier=bundle, IOClass='NativeGOPDisplay',
+diff --git a/scripts/native_storage_module.py b/scripts/native_storage_module.py
+--- a/scripts/native_storage_module.py	2026-11-02 21:52:50
++++ b/scripts/native_storage_module.py	2026-11-02 21:52:50
+@@ -113,7 +113,7 @@
+         display = evidence.get('native_gop_display')
+         input_driver = evidence.get('native_recovery_input')
+         allowed = {component, 'NativeGOPDisplay'} if display else {component}
+-        allowed |= {'UkeTouchPointer'}   # uke touch panel pointer
++        allowed |= {'UkeTouchPointer', 'UkeGpu'}   # uke touch panel pointer, Adreno 732 bring-up
+         if input_driver:
+             allowed |= {'NativeRecoveryInput', 'IOHIDEventDriver'}
+         if info['CFBundleExecutable'] != component or any(
+diff --git a/platform/sheng/macos26/storage/recovery_root.h b/platform/sheng/macos26/storage/recovery_root.h
+--- a/platform/sheng/macos26/storage/recovery_root.h
++++ b/platform/sheng/macos26/storage/recovery_root.h
+@@ -16,6 +16,14 @@
+   if (!strcmp (name, "ISC") && bytes == NATIVE_UFS_ISC_BYTES)
+     return !memcmp (digest, isc, sizeof (isc));
+ #endif
++#if defined(NATIVE_UFS_DRV_BYTES)
++  // uke: the DRV window is rewritten in place (dd from recovery), so its manifest digest is all zeros, never checked.
++  if (!strcmp (name, "DRV") && bytes == NATIVE_UFS_DRV_BYTES) {
++    uint8_t any = 0;
++    for (unsigned i = 0; i < 32; ++i) any |= digest[i];
++    return !any;
++  }
++#endif
+   return false;
+ }
+ static bool ufsRecoveryRootUuid (const char *name, uint64_t bytes, char out[37])
+@@ -35,5 +43,14 @@
+     return true;
+   }
+ #endif
++#if defined(NATIVE_UFS_DRV_BYTES)
++  // Only for the distinct-identity check of the publisher; DRV publication never waits for this UUID.
++  static const char drv[] = NATIVE_UFS_DRV_UUID;
++  static_assert (sizeof (drv) == 37, "requires the DRV window UUID");
++  if (!strcmp (name, "DRV") && bytes == NATIVE_UFS_DRV_BYTES) {
++    memcpy (out, drv, sizeof (drv));
++    return true;
++  }
++#endif
+   return false;
+ }

@@ -1,0 +1,64 @@
+diff --git a/NativeAdrenoMetalPlugin.mm b/NativeAdrenoMetalPlugin.mm
+--- a/NativeAdrenoMetalPlugin.mm
++++ b/NativeAdrenoMetalPlugin.mm
+@@ -21,6 +21,15 @@
+ #include "PrimeShaders.h"
+ #include "ExceptionDiag.h"
+ 
++// uke macOS: the process that owns the GPU and the IOKit class the kernel publishes (UkeGpu's IOAccelerator) differ from iPadOS.
++#if TARGET_OS_OSX
++static const char kRenderServer[] = "WindowServer";
++static const char kAcceleratorClass[] = "IOAccelerator";
++#else
++static const char kRenderServer[] = "backboardd";
++static const char kAcceleratorClass[] = "IOAcceleratorES";
++#endif
++
+ @interface _MTLDevice : NSObject
+ @end
+ @interface NativeAdrenoMetalDeviceBase : NSObject   // only a lock object for the published mode's one-time setup
+@@ -112,6 +121,11 @@
+     gpu.mark((base + 0x2000) | (x.mode << 4) | x.behaviour);     // mode colour field, ICC/other behaviour bytes
+ }
+ static void reportDisplayState(Gpu &gpu) {
++#if TARGET_OS_OSX
++    // The samples below read and write fixed iPadOS 17 QuartzCore addresses; nothing of them exists on macOS.
++    (void) gpu;
++    return;
++#endif
+     ++gReports;
+     static DisplaySample before;
+     static bool changed;
+@@ -270,7 +284,7 @@
+         // pass: i553 forced system memory for every pass, the GPU busy 19 % at 680 MHz. A tile store writes whole 16x4 blocks, which the
+         // runtime keeps within a texture's rows (bridge patch 0016).
+         setenv("TU_DEBUG", "nocb", 0);
+-        if (strcmp(getprogname(), "backboardd") != 0) return device = clientDevice(port);
++        if (strcmp(getprogname(), kRenderServer) != 0) return device = clientDevice(port);
+         // The discovery releases the accelerator port when it is done; the monitor and the scanout client keep using it.
+         if (void *iokit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW | RTLD_LOCAL)) {
+             if (auto retain = (int (*)(unsigned))dlsym(iokit, "IOObjectRetain")) retain(port);
+@@ -325,8 +339,14 @@
+         // why each one was passed over (c: no path, m<errno>: mkdir, a<errno>: not writable, o: the runtime refused it).
+         char candidates[6][512] = {};
+         if (!confstr(_CS_DARWIN_USER_CACHE_DIR, candidates[0], sizeof candidates[0] - 16)) candidates[0][0] = 0;
++#if TARGET_OS_OSX
++        // The Data volume of the uke is a RAM overlay, so no directory survives a boot; the DRV volume's m2vpack does.
++        strlcpy(candidates[1], "/private/var/tmp/uke-m2v/", sizeof candidates[1]);
++        strlcpy(candidates[2], "/Library/Caches/uke-m2v/", sizeof candidates[2]);
++#else
+         strlcpy(candidates[1], "/var/mobile/Library/Caches/com.apple.backboardd/", sizeof candidates[1]);
+         strlcpy(candidates[2], "/var/mobile/Library/Caches/", sizeof candidates[2]);
++#endif
+         if (!confstr(_CS_DARWIN_USER_TEMP_DIR, candidates[3], sizeof candidates[3] - 16)) candidates[3][0] = 0;
+         strlcpy(candidates[4], "/tmp/", sizeof candidates[4]);
+         strlcpy(candidates[5], "/private/var/tmp/", sizeof candidates[5]);
+@@ -580,7 +600,7 @@
+                 auto matching = (void *(*)(const char *))dlsym(iokit, "IOServiceMatching");
+                 auto getService = (unsigned (*)(unsigned, void *))dlsym(iokit, "IOServiceGetMatchingService");
+                 if (matching && getService) {
+-                    const unsigned own = getService(0, matching("IOAcceleratorES"));
++                    const unsigned own = getService(0, matching(kAcceleratorClass));
+                     if (own) port = own;
+                 }
+             }

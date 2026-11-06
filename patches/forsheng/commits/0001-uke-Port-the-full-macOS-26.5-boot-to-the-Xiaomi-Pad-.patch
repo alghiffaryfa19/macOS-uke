@@ -1,0 +1,1216 @@
+From dd37a280aa4a394861145d99321e0f118e77dc4d Mon Sep 17 00:00:00 2001
+From: iOSNJBrepo <42407902+iOSNJBrepo@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 19:47:46 +0100
+Subject: [PATCH 1/2] uke: Port the full macOS 26.5 boot to the Xiaomi Pad 7
+
+Match the xiaomi,uke device tree, scale the GOP display, and give the
+full OS volatile RAM overlays for the OS and ISC windows. Add the uke
+kernel patches for WindowServer crash reports, UI page traces, the
+unsealed root and non-fatal critical process exits, and the macoslog
+layout and recovery configs this port uses.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ config/macos26-recovery-root.basesystem.json  |  21 ++
+ config/macos26-recovery-root.json             |  16 +-
+ .../macos26-recovery-ui-pages.basesystem.json | 212 ++++++++++++++++++
+ config/macos26-recovery-ui-pages.full.json    |  79 +++++++
+ config/macos26-recovery-ui-pages.json         | 175 +++------------
+ config/macoslog.json                          |   8 +-
+ .../display/0001-native-gop-display.patch     |  11 +-
+ .../macos26/display/0002-uke-gop-scale.patch  |  55 +++++
+ ...044-native-platform-compatible-match.patch |   2 +-
+ .../0067-uke-windowserver-crash-report.patch  | 141 ++++++++++++
+ .../patches/0068-uke-ui-page-trace.patch      |  54 +++++
+ .../patches/0069-uke-unsealed-root.patch      |  18 ++
+ .../patches/0070-uke-critical-nopanic.patch   |  23 ++
+ .../sheng/macos26/storage/macoslog_layout.h   |   4 +-
+ .../sheng/macos26/storage/macoslog_worker.h   |  24 +-
+ scripts/build_macos26_storage.py              |  41 +++-
+ scripts/build_macos26_xnu.py                  |   6 +-
+ scripts/native_log_file.py                    |   4 +-
+ scripts/native_storage_module.py              |   1 +
+ scripts/prepare_macos26_gop.py                |   5 +
+ 20 files changed, 721 insertions(+), 179 deletions(-)
+ create mode 100644 config/macos26-recovery-root.basesystem.json
+ create mode 100644 config/macos26-recovery-ui-pages.basesystem.json
+ create mode 100644 config/macos26-recovery-ui-pages.full.json
+ create mode 100644 platform/sheng/macos26/display/0002-uke-gop-scale.patch
+ create mode 100644 platform/sheng/macos26/patches/0067-uke-windowserver-crash-report.patch
+ create mode 100644 platform/sheng/macos26/patches/0068-uke-ui-page-trace.patch
+ create mode 100644 platform/sheng/macos26/patches/0069-uke-unsealed-root.patch
+ create mode 100644 platform/sheng/macos26/patches/0070-uke-critical-nopanic.patch
+
+diff --git a/config/macos26-recovery-root.basesystem.json b/config/macos26-recovery-root.basesystem.json
+new file mode 100644
+index 0000000..53f8400
+--- /dev/null
++++ b/config/macos26-recovery-root.basesystem.json
+@@ -0,0 +1,21 @@
++{
++  "build": "25F71",
++  "variant": "recoveryos",
++  "window": "OS",
++  "bytes": 1577092608,
++  "sha256": "6199e53d3cf60c59790e507851ef48141dbfa23875fdde5e838446984ed56881",
++  "volume_uuid": "808eac5e-8275-478d-814c-2229d8eb8d07",
++  "isc": {
++    "window": "ISC",
++    "bytes": 2149580800,
++    "sha256": "7c5d12ffdbd7fa602429df7b81679a1d4009349dd5ffd73970b9d811eab60390",
++    "volume_uuid": "77cc1ec9-e861-449f-a511-2208a82e2929",
++    "volumes": {
++      "SHENG-xART": "77CC1EC9-E861-449F-A511-2208A82E2929",
++      "SHENG-Preboot": "75BA3DFC-C2C0-4C81-9E6A-D179A08E2E73",
++      "SHENG-Hardware": "CFE7C90C-94CB-41F0-9927-A81947B3513B"
++    },
++    "volatile_overlay_limit_bytes": 67108864,
++    "sep_trusted_storage": false
++  }
++}
+diff --git a/config/macos26-recovery-root.json b/config/macos26-recovery-root.json
+index 49af711..bf11c13 100644
+--- a/config/macos26-recovery-root.json
++++ b/config/macos26-recovery-root.json
+@@ -2,18 +2,18 @@
+   "build": "25F71",
+   "variant": "recoveryos",
+   "window": "OS",
+-  "bytes": 1577092608,
+-  "sha256": "6199e53d3cf60c59790e507851ef48141dbfa23875fdde5e838446984ed56881",
+-  "volume_uuid": "808eac5e-8275-478d-814c-2229d8eb8d07",
++  "bytes": 22737321984,
++  "sha256": "2f91771a9b1034fa5f28a93c224b0912d57fcd2ca81b570e52ece3f8c3aff13f",
++  "volume_uuid": "47719f50-5527-44a3-9f59-8170528d8c14",
+   "isc": {
+     "window": "ISC",
+     "bytes": 2149580800,
+-    "sha256": "ef3675db11103eb3db4437857cd0d875be62a5e14d7ff3b18f7700df39737f71",
+-    "volume_uuid": "eb96f3fe-29c9-438b-bb52-39de154920eb",
++    "sha256": "7c5d12ffdbd7fa602429df7b81679a1d4009349dd5ffd73970b9d811eab60390",
++    "volume_uuid": "77cc1ec9-e861-449f-a511-2208a82e2929",
+     "volumes": {
+-      "SHENG-xART": "EB96F3FE-29C9-438B-BB52-39DE154920EB",
+-      "SHENG-Preboot": "CE2D36C7-7D58-4DB7-AE57-FA78D1CC54B8",
+-      "SHENG-Hardware": "BDED3A6D-1AC9-4998-852D-C94F5F12C3C4"
++      "SHENG-xART": "77CC1EC9-E861-449F-A511-2208A82E2929",
++      "SHENG-Preboot": "75BA3DFC-C2C0-4C81-9E6A-D179A08E2E73",
++      "SHENG-Hardware": "CFE7C90C-94CB-41F0-9927-A81947B3513B"
+     },
+     "volatile_overlay_limit_bytes": 67108864,
+     "sep_trusted_storage": false
+diff --git a/config/macos26-recovery-ui-pages.basesystem.json b/config/macos26-recovery-ui-pages.basesystem.json
+new file mode 100644
+index 0000000..46bee83
+--- /dev/null
++++ b/config/macos26-recovery-ui-pages.basesystem.json
+@@ -0,0 +1,212 @@
++{
++  "schema": "sheng-recovery-ui-pages-v1",
++  "build": "25F71",
++  "architecture": "arm64e",
++  "default_off": true,
++  "disk_writes": false,
++  "authentication_success_fabricated": false,
++  "original_signature_validation_required": true,
++  "boot_argument": "sheng-recovery-ui=1",
++  "runtime_qualified": false,
++  "hardware_admitted": false,
++  "pages": [
++    {
++      "file": "dyld_shared_cache_arm64e.01",
++      "file_offset": 113344512,
++      "edits": [
++        {
++          "offset": 10444,
++          "before": "ff4302d1f65706a9f44f07a9fd7b08a9",
++          "after": "ff2303d5c0035fd61f2003d51f2003d5",
++          "policy": "native-no-metal-scaled-plan-40270321747"
++        }
++      ],
++      "before_sha256": "9cfd4ca98b039f3e0ac34a2735320c79e45fb103ed2bff91efc5b1e355741e02",
++      "after_sha256": "ac698fc1e7cec605c96d195522052e3de4390b08d7cb959efcc4814f4a20c172"
++    },
++    {
++      "file": "dyld_shared_cache_arm64e.01",
++      "file_offset": 170082304,
++      "edits": [
++        {
++          "offset": 15076,
++          "before": "e923bc6df65701a9f44f02a9fd7b03a9",
++          "after": "20488a52e048a872ff2303d5c0035fd6",
++          "policy": "native-bgra-framebuffer"
++        }
++      ],
++      "before_sha256": "398906874fd54ec79b0021329e78725c0cb2049a4b1642528797902953c2d9da",
++      "after_sha256": "bd573d310df1a21d4dee36f344b9996547d8f7c19d4cb1aaaecf0b8ed506dafc"
++    },
++    {
++      "file": "dyld_shared_cache_arm64e.01",
++      "file_offset": 1720320,
++      "edits": [
++        {
++          "offset": 7744,
++          "before": "ffc301d1fa6702a9f85f03a9f65704a9",
++          "after": "ff2303d5c0035fd61f2003d51f2003d5",
++          "policy": "legacy-syslog"
++        }
++      ],
++      "before_sha256": "28179a526441d929db4ec089ff4f9dc58cc5520798528d69aa169a793bde2b2c",
++      "after_sha256": "98789395b79348b091b3ef56d16fc5183c5c1a7d55ba87a77d42cf5372def69f"
++    },
++    {
++      "file": "dyld_shared_cache_arm64e.01",
++      "file_offset": 1687552,
++      "edits": [
++        {
++          "offset": 3848,
++          "before": "ff8304d1fc6f0ca9fa670da9f85f0ea9",
++          "after": "ff2303d5c0035fd61f2003d51f2003d5",
++          "policy": "activity-stream"
++        }
++      ],
++      "before_sha256": "aa9b042bc95817055a8fb447ffcea93738d02247ba6c11856797e28e4f1fe4ec",
++      "after_sha256": "505cec1b5532d6c074705a8f393d6a9a915ec4a1898db32ca69e21f9f311ebcf"
++    },
++    {
++      "file": "dyld_shared_cache_arm64e.01",
++      "file_offset": 115212288,
++      "edits": [
++        {
++          "offset": 8108,
++          "before": "f40300aa",
++          "after": "140a80d2",
++          "policy": "software-pool-bgra"
++        }
++      ],
++      "before_sha256": "51d8609f1fc19bd1cd482a2906b795b30f2d958ce279db2e3eb8cb280b92eec2",
++      "after_sha256": "9a06a727aeb1948551187e05bbd93d058d5703d5ec921ef5d7f34aed9afd5514"
++    },
++    {
++      "file": "dyld_shared_cache_arm64e.01",
++      "file_offset": 687915008,
++      "edits": [
++        {
++          "offset": 4412,
++          "before": "f403889a",
++          "after": "f40308aa",
++          "policy": "recovery-guest-fallback"
++        }
++      ],
++      "before_sha256": "30011a3a0da84d45c5ed7c8e899dbc2831f000e2c77f48926f88514d58ed529a",
++      "after_sha256": "6f798dbcc6887fef2bf064b5a3f5826f7ac84bd3726d556d9c8f4f69aa027158"
++    },
++    {
++      "file": "diskarbitrationd",
++      "file_offset": 98304,
++      "edits": [
++        {
++          "offset": 636,
++          "before": "730400b4",
++          "after": "23000014",
++          "policy": "fskit-unavailable-before-request"
++        }
++      ],
++      "before_sha256": "2d8e1893d1e39988560e6e1c3dd13e9e10781072afc9f933b4a58aeb8ad9a7dc",
++      "after_sha256": "c948a6cd6720f1be18e9f41c53c9cac6c7403048e6873ce13fbf829a5637b78f"
++    },
++    {
++      "file": "RecoveryOS Agent",
++      "file_offset": 0,
++      "edits": [
++        {
++          "offset": 12800,
++          "before": "0f000014",
++          "after": "2b000014",
++          "policy": "aqua-open-error-ui-continuation"
++        },
++        {
++          "offset": 12860,
++          "before": "c80000b0",
++          "after": "1c000014",
++          "policy": "aqua-unlock-error-after-cleanup"
++        }
++      ],
++      "before_sha256": "08216b1b9cbcc1fdb93703c9a3c3d512e7fb043ffbdc021dd0126e643b33bdf9",
++      "after_sha256": "c94b2d6cea227500dc755d132d5147220b7d590a4aee7cf1d37acca0274f1565"
++    },
++    {
++      "file": "recoveryosd",
++      "file_offset": 0,
++      "edits": [
++        {
++          "offset": 6576,
++          "before": "c20f0094",
++          "after": "08000014",
++          "policy": "omit-optional-keychain-login"
++        }
++      ],
++      "before_sha256": "a82410bfd5ac857b2622d8b5978532dd538bc296ed3e7f7db6e9d5766007fc62",
++      "after_sha256": "98de980f4fb08e49d2ea65c5506e0384360ec2b497861200c7227912c7c0340e"
++    },
++    {
++      "file": "Language Chooser",
++      "file_offset": 65536,
++      "edits": [
++        {
++          "offset": 3732,
++          "before": "a3340094",
++          "after": "000080d2",
++          "policy": "language-chooser-no-controller"
++        },
++        {
++          "offset": 4164,
++          "before": "37340094",
++          "after": "000080d2",
++          "policy": "language-chooser-no-controller"
++        }
++      ],
++      "before_sha256": "203804db0b02df6d610cc4ed9bc96937b66c820338d215f48ac4660cbab0afab",
++      "after_sha256": "f6c5345d5f6b98e0864826eba701c84df6d40871fd14abdd37e324ffbb6275da"
++    },
++    {
++      "file": "Recovery Springboard",
++      "file_offset": 16384,
++      "edits": [
++        {
++          "offset": 604,
++          "before": "701e0094",
++          "after": "00008052",
++          "policy": "springboard-development-activation-unsupported-after-app-quit"
++        },
++        {
++          "offset": 6740,
++          "before": "72180094",
++          "after": "00008052",
++          "policy": "springboard-development-activation-unsupported-at-window-load"
++        }
++      ],
++      "before_sha256": "bb879f48bd25cd279932f77cc818d359346151a86481f5876516b6f5c572231d",
++      "after_sha256": "b2f629e414866a61b1a4aad2fe88221f99c74d4f8899ec96548b7dbd1efde413"
++    },
++    {
++      "file": "dyld_shared_cache_arm64e.01",
++      "file_offset": 167673856,
++      "before_sha256": "5dc1ecdd702fb3a503c3f78bec7e4b315f4b0f89b5c313545ceaac0a023c0605",
++      "after_sha256": "9da662d7eb674dee620bdb05f9c9237093041f5b516585a171118c189d9be6d8",
++      "edits": [
++        {
++          "offset": 12628,
++          "before": "7f2303d5",
++          "after": "c0035fd6"
++        }
++      ]
++    },
++    {
++      "file": "dyld_shared_cache_arm64e.01",
++      "file_offset": 167690240,
++      "before_sha256": "9df3f6375041971e1a82148c10832b366187458345084e853772e46b9b05cb45",
++      "after_sha256": "70a03380dafdca472431a211a3fd22eb32a7eb0e467af9cafd4af62e9a59bbfe",
++      "edits": [
++        {
++          "offset": 5564,
++          "before": "28e88852",
++          "after": "c0035fd6"
++        }
++      ]
++    }
++  ]
++}
+diff --git a/config/macos26-recovery-ui-pages.full.json b/config/macos26-recovery-ui-pages.full.json
+new file mode 100644
+index 0000000..4819aba
+--- /dev/null
++++ b/config/macos26-recovery-ui-pages.full.json
+@@ -0,0 +1,79 @@
++{
++  "schema": "sheng-recovery-ui-pages-v1",
++  "build": "25F71",
++  "architecture": "arm64e",
++  "default_off": true,
++  "disk_writes": false,
++  "authentication_success_fabricated": false,
++  "original_signature_validation_required": true,
++  "boot_argument": "sheng-recovery-ui=1",
++  "runtime_qualified": false,
++  "hardware_admitted": false,
++  "pages": [
++    {
++      "file": "dyld_shared_cache_arm64e.01",
++      "file_offset": 115998720,
++      "before_sha256": "41989a0cecf2b58bcd361c77e467e4eaa02053d50a27ac62d06b99350ebe9f46",
++      "after_sha256": "7ac4cb9f499a688d664be2dcefb32a2a7b52bc9bfffae31f05054334bfe17b24",
++      "edits": [
++        {
++          "offset": 6348,
++          "before": "ff4302d1f65706a9f44f07a9fd7b08a9",
++          "after": "ff2303d5c0035fd61f2003d51f2003d5"
++        }
++      ]
++    },
++    {
++      "file": "dyld_shared_cache_arm64e.01",
++      "file_offset": 176832512,
++      "before_sha256": "7159ed4bc4165dc9ac5db41923c4ccd24ee736efc9c161ac102f1bad1d0e83d2",
++      "after_sha256": "df774ff2cc6020b9f0f66f768708b3455a40fa3a61c4c4afa45fa93aa85f99ed",
++      "edits": [
++        {
++          "offset": 10980,
++          "before": "e923bc6df65701a9f44f02a9fd7b03a9",
++          "after": "20488a52e048a872ff2303d5c0035fd6"
++        }
++      ]
++    },
++    {
++      "file": "dyld_shared_cache_arm64e.01",
++      "file_offset": 117866496,
++      "before_sha256": "fc90dc40b51e8506f8d8a371c10810d78b932d66936569f4418aa418f55e6d68",
++      "after_sha256": "0f34ab34626e345364343dfe876f293cddc86caf1645d1d1053c6b788962509d",
++      "edits": [
++        {
++          "offset": 4012,
++          "before": "f40300aa",
++          "after": "140a80d2"
++        }
++      ]
++    },
++    {
++      "file": "dyld_shared_cache_arm64e.01",
++      "file_offset": 174424064,
++      "before_sha256": "24f2978bc25b6fd2b7a3a35f1c64603fb2883d4048a681d8fe417735ec7c77ff",
++      "after_sha256": "016064aa14729949e2b2e93538bcee7c373aeb0c2cdbc0df0b2d0eb60b72f3ca",
++      "edits": [
++        {
++          "offset": 8532,
++          "before": "7f2303d5",
++          "after": "c0035fd6"
++        }
++      ]
++    },
++    {
++      "file": "dyld_shared_cache_arm64e.01",
++      "file_offset": 174440448,
++      "before_sha256": "cb8056291600014359a1000f0ea51c43c812edd52a1a4bee5eece537e279ad1b",
++      "after_sha256": "55afa4571a240b1d2c29096df9ca829d807e2af2ae97ae8720ba1bd8014ab070",
++      "edits": [
++        {
++          "offset": 1468,
++          "before": "28e88852",
++          "after": "c0035fd6"
++        }
++      ]
++    }
++  ]
++}
+\ No newline at end of file
+diff --git a/config/macos26-recovery-ui-pages.json b/config/macos26-recovery-ui-pages.json
+index 2ec8bd7..4819aba 100644
+--- a/config/macos26-recovery-ui-pages.json
++++ b/config/macos26-recovery-ui-pages.json
+@@ -12,175 +12,68 @@
+   "pages": [
+     {
+       "file": "dyld_shared_cache_arm64e.01",
+-      "file_offset": 113344512,
++      "file_offset": 115998720,
++      "before_sha256": "41989a0cecf2b58bcd361c77e467e4eaa02053d50a27ac62d06b99350ebe9f46",
++      "after_sha256": "7ac4cb9f499a688d664be2dcefb32a2a7b52bc9bfffae31f05054334bfe17b24",
+       "edits": [
+         {
+-          "offset": 10444,
++          "offset": 6348,
+           "before": "ff4302d1f65706a9f44f07a9fd7b08a9",
+-          "after": "ff2303d5c0035fd61f2003d51f2003d5",
+-          "policy": "native-no-metal-scaled-plan-40270321747"
++          "after": "ff2303d5c0035fd61f2003d51f2003d5"
+         }
+-      ],
+-      "before_sha256": "9cfd4ca98b039f3e0ac34a2735320c79e45fb103ed2bff91efc5b1e355741e02",
+-      "after_sha256": "ac698fc1e7cec605c96d195522052e3de4390b08d7cb959efcc4814f4a20c172"
++      ]
+     },
+     {
+       "file": "dyld_shared_cache_arm64e.01",
+-      "file_offset": 170082304,
++      "file_offset": 176832512,
++      "before_sha256": "7159ed4bc4165dc9ac5db41923c4ccd24ee736efc9c161ac102f1bad1d0e83d2",
++      "after_sha256": "df774ff2cc6020b9f0f66f768708b3455a40fa3a61c4c4afa45fa93aa85f99ed",
+       "edits": [
+         {
+-          "offset": 15076,
++          "offset": 10980,
+           "before": "e923bc6df65701a9f44f02a9fd7b03a9",
+-          "after": "20488a52e048a872ff2303d5c0035fd6",
+-          "policy": "native-bgra-framebuffer"
++          "after": "20488a52e048a872ff2303d5c0035fd6"
+         }
+-      ],
+-      "before_sha256": "398906874fd54ec79b0021329e78725c0cb2049a4b1642528797902953c2d9da",
+-      "after_sha256": "bd573d310df1a21d4dee36f344b9996547d8f7c19d4cb1aaaecf0b8ed506dafc"
++      ]
+     },
+     {
+       "file": "dyld_shared_cache_arm64e.01",
+-      "file_offset": 1720320,
++      "file_offset": 117866496,
++      "before_sha256": "fc90dc40b51e8506f8d8a371c10810d78b932d66936569f4418aa418f55e6d68",
++      "after_sha256": "0f34ab34626e345364343dfe876f293cddc86caf1645d1d1053c6b788962509d",
+       "edits": [
+         {
+-          "offset": 7744,
+-          "before": "ffc301d1fa6702a9f85f03a9f65704a9",
+-          "after": "ff2303d5c0035fd61f2003d51f2003d5",
+-          "policy": "legacy-syslog"
+-        }
+-      ],
+-      "before_sha256": "28179a526441d929db4ec089ff4f9dc58cc5520798528d69aa169a793bde2b2c",
+-      "after_sha256": "98789395b79348b091b3ef56d16fc5183c5c1a7d55ba87a77d42cf5372def69f"
+-    },
+-    {
+-      "file": "dyld_shared_cache_arm64e.01",
+-      "file_offset": 1687552,
+-      "edits": [
+-        {
+-          "offset": 3848,
+-          "before": "ff8304d1fc6f0ca9fa670da9f85f0ea9",
+-          "after": "ff2303d5c0035fd61f2003d51f2003d5",
+-          "policy": "activity-stream"
+-        }
+-      ],
+-      "before_sha256": "aa9b042bc95817055a8fb447ffcea93738d02247ba6c11856797e28e4f1fe4ec",
+-      "after_sha256": "505cec1b5532d6c074705a8f393d6a9a915ec4a1898db32ca69e21f9f311ebcf"
+-    },
+-    {
+-      "file": "dyld_shared_cache_arm64e.01",
+-      "file_offset": 115212288,
+-      "edits": [
+-        {
+-          "offset": 8108,
++          "offset": 4012,
+           "before": "f40300aa",
+-          "after": "140a80d2",
+-          "policy": "software-pool-bgra"
++          "after": "140a80d2"
+         }
+-      ],
+-      "before_sha256": "51d8609f1fc19bd1cd482a2906b795b30f2d958ce279db2e3eb8cb280b92eec2",
+-      "after_sha256": "9a06a727aeb1948551187e05bbd93d058d5703d5ec921ef5d7f34aed9afd5514"
++      ]
+     },
+     {
+       "file": "dyld_shared_cache_arm64e.01",
+-      "file_offset": 687915008,
+-      "edits": [
+-        {
+-          "offset": 4412,
+-          "before": "f403889a",
+-          "after": "f40308aa",
+-          "policy": "recovery-guest-fallback"
+-        }
+-      ],
+-      "before_sha256": "30011a3a0da84d45c5ed7c8e899dbc2831f000e2c77f48926f88514d58ed529a",
+-      "after_sha256": "6f798dbcc6887fef2bf064b5a3f5826f7ac84bd3726d556d9c8f4f69aa027158"
+-    },
+-    {
+-      "file": "diskarbitrationd",
+-      "file_offset": 98304,
+-      "edits": [
+-        {
+-          "offset": 636,
+-          "before": "730400b4",
+-          "after": "23000014",
+-          "policy": "fskit-unavailable-before-request"
+-        }
+-      ],
+-      "before_sha256": "2d8e1893d1e39988560e6e1c3dd13e9e10781072afc9f933b4a58aeb8ad9a7dc",
+-      "after_sha256": "c948a6cd6720f1be18e9f41c53c9cac6c7403048e6873ce13fbf829a5637b78f"
+-    },
+-    {
+-      "file": "RecoveryOS Agent",
+-      "file_offset": 0,
+-      "edits": [
+-        {
+-          "offset": 12800,
+-          "before": "0f000014",
+-          "after": "2b000014",
+-          "policy": "aqua-open-error-ui-continuation"
+-        },
+-        {
+-          "offset": 12860,
+-          "before": "c80000b0",
+-          "after": "1c000014",
+-          "policy": "aqua-unlock-error-after-cleanup"
+-        }
+-      ],
+-      "before_sha256": "08216b1b9cbcc1fdb93703c9a3c3d512e7fb043ffbdc021dd0126e643b33bdf9",
+-      "after_sha256": "c94b2d6cea227500dc755d132d5147220b7d590a4aee7cf1d37acca0274f1565"
+-    },
+-    {
+-      "file": "recoveryosd",
+-      "file_offset": 0,
++      "file_offset": 174424064,
++      "before_sha256": "24f2978bc25b6fd2b7a3a35f1c64603fb2883d4048a681d8fe417735ec7c77ff",
++      "after_sha256": "016064aa14729949e2b2e93538bcee7c373aeb0c2cdbc0df0b2d0eb60b72f3ca",
+       "edits": [
+         {
+-          "offset": 6576,
+-          "before": "c20f0094",
+-          "after": "08000014",
+-          "policy": "omit-optional-keychain-login"
++          "offset": 8532,
++          "before": "7f2303d5",
++          "after": "c0035fd6"
+         }
+-      ],
+-      "before_sha256": "a82410bfd5ac857b2622d8b5978532dd538bc296ed3e7f7db6e9d5766007fc62",
+-      "after_sha256": "98de980f4fb08e49d2ea65c5506e0384360ec2b497861200c7227912c7c0340e"
++      ]
+     },
+     {
+-      "file": "Language Chooser",
+-      "file_offset": 65536,
+-      "edits": [
+-        {
+-          "offset": 3732,
+-          "before": "a3340094",
+-          "after": "000080d2",
+-          "policy": "language-chooser-no-controller"
+-        },
+-        {
+-          "offset": 4164,
+-          "before": "37340094",
+-          "after": "000080d2",
+-          "policy": "language-chooser-no-controller"
+-        }
+-      ],
+-      "before_sha256": "203804db0b02df6d610cc4ed9bc96937b66c820338d215f48ac4660cbab0afab",
+-      "after_sha256": "f6c5345d5f6b98e0864826eba701c84df6d40871fd14abdd37e324ffbb6275da"
+-    },
+-    {
+-      "file": "Recovery Springboard",
+-      "file_offset": 16384,
++      "file": "dyld_shared_cache_arm64e.01",
++      "file_offset": 174440448,
++      "before_sha256": "cb8056291600014359a1000f0ea51c43c812edd52a1a4bee5eece537e279ad1b",
++      "after_sha256": "55afa4571a240b1d2c29096df9ca829d807e2af2ae97ae8720ba1bd8014ab070",
+       "edits": [
+         {
+-          "offset": 604,
+-          "before": "701e0094",
+-          "after": "00008052",
+-          "policy": "springboard-development-activation-unsupported-after-app-quit"
+-        },
+-        {
+-          "offset": 6740,
+-          "before": "72180094",
+-          "after": "00008052",
+-          "policy": "springboard-development-activation-unsupported-at-window-load"
++          "offset": 1468,
++          "before": "28e88852",
++          "after": "c0035fd6"
+         }
+-      ],
+-      "before_sha256": "bb879f48bd25cd279932f77cc818d359346151a86481f5876516b6f5c572231d",
+-      "after_sha256": "b2f629e414866a61b1a4aad2fe88221f99c74d4f8899ec96548b7dbd1efde413"
++      ]
+     }
+   ]
+-}
++}
+\ No newline at end of file
+diff --git a/config/macoslog.json b/config/macoslog.json
+index 86190e8..b586ca1 100644
+--- a/config/macoslog.json
++++ b/config/macoslog.json
+@@ -1,10 +1,10 @@
+ {
+   "schema": "sheng-macoslog-v1",
+-  "lun": 4,
++  "lun": 0,
+   "block_bytes": 4096,
+-  "disk_blocks": 521216,
+-  "partition_index": 78,
+-  "partition_first": 448512,
++  "disk_blocks": 30709760,
++  "partition_index": 32,
++  "partition_first": 30693371,
+   "partition_blocks": 16384,
+   "partition_uuid": "4cd2ed34-2142-4ea4-abf2-ec6c51d117d7",
+   "partition_type": "ebd0a0a2-b9e5-4433-87c0-68b6b72699c7",
+diff --git a/platform/sheng/macos26/display/0001-native-gop-display.patch b/platform/sheng/macos26/display/0001-native-gop-display.patch
+index 6e5f111..1496940 100644
+--- a/platform/sheng/macos26/display/0001-native-gop-display.patch
++++ b/platform/sheng/macos26/display/0001-native-gop-display.patch
+@@ -551,13 +551,14 @@
+              break;
+          if (!(appendDictionary(chromaticity, "Red", point(41943, 21627)) && appendDictionary(chromaticity, "Green", point(19661, 39322)) &&
+ @@ -554,8 +575,8 @@
+-               attributes->setObject("Chromaticity", chromaticity) && attributes->setObject("DefaultColorSpaceIsSRGB", kOSBooleanFalse) &&
++-              attributes->setObject("Chromaticity", chromaticity) && attributes->setObject("DefaultColorSpaceIsSRGB", kOSBooleanFalse) &&
+++              attributes->setObject("Chromaticity", chromaticity) && attributes->setObject("DefaultColorSpaceIsSRGB", kOSBooleanTrue) &&
+                attributes->setObject("DefaultWhitePoint", whitePoint) && attributes->setObject("SupportsStandby", kOSBooleanTrue) &&
+                appendNumber(attributes, "ContinuousFrequencySupport", 3) &&
+ -              appendNumber(attributes, "MaxHorizontalImageSize", (kWidthMM + 5) / 10) &&
+ -              appendNumber(attributes, "MaxVerticalImageSize", (kHeightMM + 5) / 10) &&
+-+              appendNumber(attributes, "MaxHorizontalImageSize", (width * 254 + 4800) / 9600) &&
+-+              appendNumber(attributes, "MaxVerticalImageSize", (height * 254 + 4800) / 9600) &&
+++              appendNumber(attributes, "MaxHorizontalImageSize", (width * 254 + 16500) / 33000) &&
+++              appendNumber(attributes, "MaxVerticalImageSize", (height * 254 + 16500) / 33000) &&
+                appendNumber(attributes, "NativeFormatHorizontalPixels", width) && appendNumber(attributes, "NativeFormatVerticalPixels", height) &&
+                appendNumber(attributes, "PreciseAspectRatio", (static_cast<uint64_t>(width) << 16) / height)))
+              break;
+@@ -597,10 +598,10 @@
+ -IOReturn DroidVMDisplay::get_dot_pitch(unsigned int *pitch)
+ -{
+ -    *pitch = static_cast<unsigned int>(fVideo.v_width * 25.46 / kWidthMM + 0.5);
+-+// GOP supplies no EDID here; use a 96-dpi logical fallback.
+++// GOP supplies no EDID here; uke: the Pad 7 panel is ~330 dpi (3200x2136 on 11.2"), so WindowServer picks HiDPI.
+ +IOReturn NativeGOPDisplay::get_dot_pitch(unsigned int *pitch)
+ +{
+-+    *pitch = 96;
+++    *pitch = 330;
+      return kIOReturnSuccess;
+  }
+  
+diff --git a/platform/sheng/macos26/display/0002-uke-gop-scale.patch b/platform/sheng/macos26/display/0002-uke-gop-scale.patch
+new file mode 100644
+index 0000000..d439b0b
+--- /dev/null
++++ b/platform/sheng/macos26/display/0002-uke-gop-scale.patch
+@@ -0,0 +1,55 @@
++--- a/NativeGOPDisplay.cpp
+++++ b/NativeGOPDisplay.cpp
++@@ -160,6 +160,19 @@
++     {1, kIOPMDeviceUsable, kIOPMPowerOn, kIOPMPowerOn, 0, 0, 0, 0, 0, 0, 0, 0},
++ };
++ 
+++// uke: native-gop-scale=2 advertises half the panel (1600x1068 on 3200x2136); WindowServer composites a quarter of the
+++// pixels and the scanout copy doubles them back. Only the advertised mode, timing and layer choice use this size.
+++static uint64_t ukeGopScale(void)
+++{
+++    static uint32_t scale;
+++    if (!scale) {
+++        uint32_t value = 1;
+++        PE_parse_boot_argn("native-gop-scale", &value, sizeof(value));
+++        scale = (value == 2) ? 2 : 1;
+++    }
+++    return scale;
+++}
+++
++ bool NativeGOPDisplay::start(IOService *provider)
++ {
++     unsigned enabled = 0, cpus = 0;
++@@ -342,7 +355,7 @@
++                        ioSurfacePixelFormat(surfaces[i])};
++         shape = shape * 31 + geometry[i].width * 65537 + geometry[i].height;
++     }
++-    int selected = nativeGopScanoutLayer(geometry, mask, fVideo.v_width, fVideo.v_height);
+++    int selected = nativeGopScanoutLayer(geometry, mask, fVideo.v_width / ukeGopScale(), fVideo.v_height / ukeGopScale());
++     if (shape != fLayerShape) {
++         fLayerShape = shape;
++         IOLog("NativeGOPDisplay: swap mask=%#x scanout layer=%d\n", mask, selected);
++@@ -522,7 +535,7 @@
++ // 8-bit SDR color element. Chromaticities are sRGB's (16.16 fixed point, as the panel's EDID would give them).
++ bool NativeGOPDisplay::createDisplayAttributes()
++ {
++-    uint32_t width = static_cast<uint32_t>(fVideo.v_width), height = static_cast<uint32_t>(fVideo.v_height);
+++    uint32_t width = static_cast<uint32_t>(fVideo.v_width / ukeGopScale()), height = static_cast<uint32_t>(fVideo.v_height / ukeGopScale());
++     if (static_cast<uint64_t>(width + 160) * (height + 23) * kRefreshHz > UINT32_MAX)
++         return false;
++     bool done = false;
++@@ -619,10 +632,10 @@
++ {
++     if (colorID != kColorID || timingID != kTimingID)
++         return kIOReturnBadArgument;
++-    at<uint32_t>(this, kDisplayWidth) = static_cast<uint32_t>(fVideo.v_width);
++-    at<uint32_t>(this, kDisplayHeight) = static_cast<uint32_t>(fVideo.v_height);
++-    setProperty("DisplayWidth", fVideo.v_width, 32);
++-    setProperty("DisplayHeight", fVideo.v_height, 32);
+++    at<uint32_t>(this, kDisplayWidth) = static_cast<uint32_t>(fVideo.v_width / ukeGopScale());
+++    at<uint32_t>(this, kDisplayHeight) = static_cast<uint32_t>(fVideo.v_height / ukeGopScale());
+++    setProperty("DisplayWidth", fVideo.v_width / ukeGopScale(), 32);
+++    setProperty("DisplayHeight", fVideo.v_height / ukeGopScale(), 32);
++     setProperty("DPTimingModeId", timingID, 32);
++     return kIOReturnSuccess;
++ }
+diff --git a/platform/sheng/macos26/patches/0044-native-platform-compatible-match.patch b/platform/sheng/macos26/patches/0044-native-platform-compatible-match.patch
+index b888bc8..d398631 100644
+--- a/platform/sheng/macos26/patches/0044-native-platform-compatible-match.patch
++++ b/platform/sheng/macos26/patches/0044-native-platform-compatible-match.patch
+@@ -5,7 +5,7 @@
+      "     'IOClass'         = ArmDTPlatform;"
+      "     'IOProviderClass' = IOPlatformExpertDevice;"
+ -    "     'IONameMatch'     = 'device-tree';"
+-+    "     'IONameMatch'     = ( 'device-tree', 'xiaomi,sheng' );"
+++    "     'IONameMatch'     = ( 'device-tree', 'xiaomi,sheng', 'xiaomi,uke' );"
+      "     'IOProbeScore'    = 5000:32;"
+      "   },"
+  #endif
+diff --git a/platform/sheng/macos26/patches/0067-uke-windowserver-crash-report.patch b/platform/sheng/macos26/patches/0067-uke-windowserver-crash-report.patch
+new file mode 100644
+index 0000000..2db769c
+--- /dev/null
++++ b/platform/sheng/macos26/patches/0067-uke-windowserver-crash-report.patch
+@@ -0,0 +1,141 @@
++--- a/bsd/kern/kern_exit.c
+++++ b/bsd/kern/kern_exit.c
++@@ -2021,12 +2021,138 @@
++ 		    ((proc_getcsflags(p) & CS_KILLED) ? "CS_KILLED" : ""),
++ 		    prefix_str, p->p_exit_reason->osr_namespace, p->p_exit_reason->osr_code,
++ 		    exit_reason_desc ? exit_reason_desc : "none");
+++	}
+++}
+++
+++#if SHENG
+++#include <stdarg.h>
+++#include <mach/shared_region.h>
+++#include <vm/vm_shared_region_internal.h>
+++extern struct arm_saved_state *find_user_regs(thread_t);
+++/*
+++ * uke: when WindowServer exits, log what its own crash report would hold: the exit reason with its
+++ * description, the shared cache slide, the user frame-pointer backtrace of the exiting thread and the
+++ * libsystem_c __crash_info annotations (abort messages). The unslid __crash_info address of the paired
+++ * 25F71 cache comes from boot-arg uke-crashinfo (0x1ae5d6c40, 0x148 bytes).
+++ */
+++static TUNABLE(uint64_t, uke_crashinfo_addr, "uke-crashinfo", 0);
+++/* Unslid address of a char * holding an abort message (SkyLight keeps its own: 0x1ae74a558 in 25F71). */
+++static TUNABLE(uint64_t, uke_crashmsg_ptr, "uke-crashmsg", 0);
+++/* Keep the reports and print them again every 30 s, so they stay inside the retained log tail. */
+++static char uke_ws_saved[4096];
+++static size_t uke_ws_saved_len;
+++static thread_call_t uke_ws_reprint_call;
+++static void
+++uke_ws_reprint(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+++{
+++	if (uke_ws_saved_len) {
+++		printf("UKE-WS-SAVED (%zu bytes):\n%s", uke_ws_saved_len, uke_ws_saved);
+++	}
+++	uint64_t deadline;
+++	nanoseconds_to_absolutetime(30ULL * NSEC_PER_SEC, &deadline);
+++	thread_call_enter_delayed(uke_ws_reprint_call, mach_absolute_time() + deadline);
+++}
+++static void
+++uke_ws_log(const char *fmt, ...) __printflike(1, 2);
+++static void
+++uke_ws_log(const char *fmt, ...)
+++{
+++	char line[300];
+++	va_list ap;
+++	va_start(ap, fmt);
+++	int n = vsnprintf(line, sizeof(line), fmt, ap);
+++	va_end(ap);
+++	printf("%s", line);
+++	if (n > 0 && uke_ws_saved_len + (size_t)n < sizeof(uke_ws_saved)) {
+++		memcpy(uke_ws_saved + uke_ws_saved_len, line, (size_t)n);
+++		uke_ws_saved_len += (size_t)n;
+++		uke_ws_saved[uke_ws_saved_len] = 0;
+++	}
+++}
+++static void
+++uke_windowserver_report(proc_t p, int rv)
+++{
+++	if (!uke_ws_reprint_call) {
+++		uke_ws_reprint_call = thread_call_allocate_with_options(uke_ws_reprint, NULL, THREAD_CALL_PRIORITY_LOW, 0);
+++		if (uke_ws_reprint_call) {
+++			uke_ws_reprint(NULL, NULL);
+++		}
+++	}
+++	char *desc = exit_reason_get_string_desc(p->p_exit_reason);
+++	uint32_t slide = 0;
+++	vm_shared_region_t sr = vm_shared_region_get(proc_task(p));
+++
+++	uke_ws_log("UKE-WS: pid %d exit rv=0x%x reason ns=%u code=0x%llx desc=%s\n", proc_getpid(p), rv,
+++	    p->p_exit_reason ? p->p_exit_reason->osr_namespace : 0,
+++	    p->p_exit_reason ? p->p_exit_reason->osr_code : 0ULL, desc ? desc : "none");
+++	if (sr) {
+++		mach_vm_offset_t start = 0;
+++		if (vm_shared_region_start_address(sr, &start) == KERN_SUCCESS && start >= SHARED_REGION_BASE_ARM64) {
+++			slide = (uint32_t)(start - SHARED_REGION_BASE_ARM64);
+++		}
+++		vm_shared_region_deallocate(sr);
+++	}
+++	uke_ws_log("UKE-WS: shared cache slide=0x%x\n", slide);
+++	arm_saved_state_t *ss = find_user_regs(current_thread());
+++	if (ss && is_saved_state64(ss)) {
+++		uint64_t fp = get_saved_state_fp(ss);
+++		uke_ws_log("UKE-WS: pc=0x%llx lr=0x%llx fp=0x%llx\n", get_saved_state_pc(ss) & 0x7fffffffffULL,
+++		    get_saved_state_lr(ss) & 0x7fffffffffULL, fp);
+++		for (int i = 0; i < 32 && fp && !(fp & 7); i++) {
+++			uint64_t frame[2];
+++			if (copyin((user_addr_t)fp, frame, sizeof(frame))) {
+++				break;
+++			}
+++			uke_ws_log("UKE-WS: #%d 0x%llx\n", i, frame[1] & 0x7fffffffffULL);
+++			if (frame[0] <= fp) {
+++				break;
+++			}
+++			fp = frame[0];
+++		}
+++	}
+++	if (uke_crashmsg_ptr && slide) {
+++		uint64_t message = 0;
+++		char text[256];
+++		size_t done = 0;
+++		if (copyin((user_addr_t)(uke_crashmsg_ptr + slide), &message, sizeof(message)) == 0 && message) {
+++			int err = copyinstr((user_addr_t)message, text, sizeof(text), &done);
+++			if (err == 0 || done == sizeof(text)) {
+++				text[sizeof(text) - 1] = 0;
+++				uke_ws_log("UKE-WS: message: %s\n", text);
+++			}
+++		}
+++	}
+++	if (uke_crashinfo_addr && slide) {
+++		uint64_t annotations[0x148 / 8];
+++		if (copyin((user_addr_t)(uke_crashinfo_addr + slide), annotations, sizeof(annotations)) == 0) {
+++			for (unsigned i = 0; i + 8 <= 0x148 / 8; i += 8) {
+++				/* crashreporter_annotations_t: version, message, signature_string, backtrace, message2, ... */
+++				for (unsigned f = 1; f <= 4; f++) {
+++					char text[256];
+++					size_t done = 0;
+++					if (!annotations[i + f] || f == 3) {
+++						continue;
+++					}
+++					if (copyinstr((user_addr_t)annotations[i + f], text, sizeof(text), &done) == 0 ||
+++					    done == sizeof(text)) {
+++						text[sizeof(text) - 1] = 0;
+++						uke_ws_log("UKE-WS: crash_info[%u].%u: %s\n", i / 8, f, text);
+++					}
+++				}
+++			}
+++		}
++ 	}
++ }
+++#endif
++ 
++ void
++ proc_prepareexit(proc_t p, int rv, boolean_t perf_notify)
++ {
+++#if SHENG
+++	if (!strncmp(p->p_comm, "WindowServer", sizeof(p->p_comm)) || !strncmp(p->p_comm, "loginwindow", sizeof(p->p_comm))) {
+++		uke_windowserver_report(p, rv);
+++	}
+++#endif
++ 	mach_exception_data_type_t code = 0, subcode = 0, saved_code = 0;
++ 	exception_type_t etype;
++ 
+diff --git a/platform/sheng/macos26/patches/0068-uke-ui-page-trace.patch b/platform/sheng/macos26/patches/0068-uke-ui-page-trace.patch
+new file mode 100644
+index 0000000..9d7b96f
+--- /dev/null
++++ b/platform/sheng/macos26/patches/0068-uke-ui-page-trace.patch
+@@ -0,0 +1,54 @@
++--- a/osfmk/vm/vm_fault.c
+++++ b/osfmk/vm/vm_fault.c
++@@ -8834,6 +8834,31 @@
++  *	4. no longer have a backing store.
++  * Returns FALSE if the page needs to be fully validated.
++  */
+++#if SHENG && (DEVELOPMENT || DEBUG)
+++extern const char *vnode_getname(struct vnode *);
+++extern void vnode_putname(const char *);
+++/* uke: trace code-signing validation of the two Recovery UI policy pages that never apply (rules 0, 1). */
+++static void
+++uke_ui_trace(vm_page_t page, vm_object_t object, const char *where, int extra)
+++{
+++	if (object->internal || !object->pager || !object->code_signed) {
+++		return;
+++	}
+++	memory_object_offset_t off = page->vmp_offset + object->paging_offset;
+++	if (off != 0x6c18000ULL && off != 0xa234000ULL) {
+++		return;
+++	}
+++	struct vnode *vp = vnode_pager_lookup_vnode(object->pager);
+++	const char *name = vp ? vnode_getname(vp) : NULL;
+++	printf("UKE-UI: %s off=0x%llx file=%s val=0x%x taint=0x%x nx=0x%x wp=%d extra=%d\n", where, off,
+++	    name ? name : "?", page->vmp_cs_validated, page->vmp_cs_tainted, page->vmp_cs_nx,
+++	    page->vmp_wpmapped, extra);
+++	if (name) {
+++		vnode_putname(name);
+++	}
+++}
+++#endif
+++
++ static boolean_t
++ vm_page_validate_cs_fast(
++ 	vm_page_t       page,
++@@ -8844,6 +8869,9 @@
++ 
++ 	object = VM_PAGE_OBJECT(page);
++ 	vm_object_lock_assert_held(object);
+++#if SHENG && (DEVELOPMENT || DEBUG)
+++	uke_ui_trace(page, object, "fast", (int)fault_page_size);
+++#endif
++ 
++ 	if (page->vmp_wpmapped &&
++ 	    !VMP_CS_TAINTED(page, fault_page_size, fault_phys_offset)) {
++@@ -8952,6 +8980,9 @@
++ 	page->vmp_cs_validated |= validated;
++ 	page->vmp_cs_tainted |= tainted;
++ 	page->vmp_cs_nx |= nx;
+++#if SHENG && (DEVELOPMENT || DEBUG)
+++	uke_ui_trace(page, object, "slow", validated);
+++#endif
++ 
++ #if SHENG && (DEVELOPMENT || DEBUG)
++ 	sheng_recovery_ui_page(page, vnode, mo_offset,
+diff --git a/platform/sheng/macos26/patches/0069-uke-unsealed-root.patch b/platform/sheng/macos26/patches/0069-uke-unsealed-root.patch
+new file mode 100644
+index 0000000..bfb9265
+--- /dev/null
++++ b/platform/sheng/macos26/patches/0069-uke-unsealed-root.patch
+@@ -0,0 +1,18 @@
++--- a/bsd/kern/bsd_init.c
+++++ b/bsd/kern/bsd_init.c
++@@ -952,6 +952,15 @@
++ 			/* enforce sealedness */
++ 			int autherr = VNOP_IOCTL(rootvnode, FSIOC_KERNEL_ROOTAUTH, NULL, 0, vfs_context_kernel());
++ 			if (autherr) {
+++#if SHENG
+++				/* uke: full macOS boots the unsealed IPSW system volume; allowed only when SIP permits an
+++				 * unauthenticated root (lp-sip1) and boot-arg uke-unsealed-root=1 asks for it. */
+++				uint32_t unsealed = 0;
+++				if (csr_check(CSR_ALLOW_UNAUTHENTICATED_ROOT) == 0 &&
+++				    PE_parse_boot_argn("uke-unsealed-root", &unsealed, sizeof(unsealed)) && unsealed == 1) {
+++					printf("uke: root volume not authenticated (error %d); continuing on an unsealed root\n", autherr);
+++				} else
+++#endif
++ 				panic("rootvp not authenticated after mounting");
++ 			}
++ 		}
+diff --git a/platform/sheng/macos26/patches/0070-uke-critical-nopanic.patch b/platform/sheng/macos26/patches/0070-uke-critical-nopanic.patch
+new file mode 100644
+index 0000000..ba58504
+--- /dev/null
++++ b/platform/sheng/macos26/patches/0070-uke-critical-nopanic.patch
+@@ -0,0 +1,23 @@
++--- a/bsd/kern/kern_exit.c
+++++ b/bsd/kern/kern_exit.c
++@@ -1968,8 +1968,20 @@
++ {
++ 	if (!proc_should_trigger_panic(p, rv)) {
++ 		// No panic, bail out
+++		return;
+++	}
+++#if SHENG
+++	/* uke: daemons marked critical (watchdogd, ...) can die on hardware a Mac has and the tablet lacks; with
+++	 * uke-critical-nopanic=1 their exit is logged instead of panicking. launchd itself keeps the panic. */
+++	uint32_t uke_nopanic = 0;
+++	if (p != initproc && PE_parse_boot_argn("uke-critical-nopanic", &uke_nopanic, sizeof(uke_nopanic)) && uke_nopanic == 1) {
+++		printf("uke: critical process %s[%d] exited (signal %d, exit %d, reason ns %u code 0x%llx); not panicking\n",
+++		    p->p_comm, proc_getpid(p), WTERMSIG(rv), WEXITSTATUS(rv),
+++		    p->p_exit_reason ? p->p_exit_reason->osr_namespace : 0,
+++		    p->p_exit_reason ? p->p_exit_reason->osr_code : 0ULL);
++ 		return;
++ 	}
+++#endif
++ 
++ #if DEVELOPMENT
++ 	if (crash_behavior_test_mode) {
+diff --git a/platform/sheng/macos26/storage/macoslog_layout.h b/platform/sheng/macos26/storage/macoslog_layout.h
+index 09e7fe3..ed2360c 100644
+--- a/platform/sheng/macos26/storage/macoslog_layout.h
++++ b/platform/sheng/macos26/storage/macoslog_layout.h
+@@ -87,8 +87,8 @@ static inline bool mlFile(const MlFat &g, const uint8_t *fat, const uint8_t *roo
+         uint32_t other = ml16(e + 26);
+         if (other >= cluster && other < cluster + count) return false;
+     }
+-    first = 448512 + g.dataFirst + (cluster - 2) * g.clusterBlocks;
+-    return first > 448512 && first + 512 <= 464896;
++    first = ML_FAT_FIRST + g.dataFirst + (cluster - 2) * g.clusterBlocks;
++    return first > ML_FAT_FIRST && first + 512 <= ML_FAT_FIRST + 16384;
+ }
+ static inline bool mlGuard(const uint8_t *p, uint64_t first, const uint8_t *fileId, const uint8_t *partitionId) {
+     return !memcmp(p, "SHNGSLOT", 8) && ml32(p + 8) == 1 && ml32(p + 12) == 4096 &&
+diff --git a/platform/sheng/macos26/storage/macoslog_worker.h b/platform/sheng/macos26/storage/macoslog_worker.h
+index 69621ee..0725b4d 100644
+--- a/platform/sheng/macos26/storage/macoslog_worker.h
++++ b/platform/sheng/macos26/storage/macoslog_worker.h
+@@ -1,5 +1,8 @@
+ /* SPDX-License-Identifier: MIT */
+ /* Included by the native UFS adapter after its bounded command helpers. */
++// uke: the log FAT is the last 64 MiB of userdata on LUN 0 (no free GPT slot), not a LUN 4 partition.
++#define ML_LUN 0
++#define ML_FAT_FIRST 30693371ULL
+ #include "macoslog_layout.h"
+ extern "C" unsigned sheng_log_snapshot_copy(void *, unsigned);
+ extern "C" void sheng_boot_log_state(unsigned, unsigned, uint64_t);
+@@ -16,28 +19,21 @@ static bool mlRunning;
+ static volatile uint32_t mlStop;
+ 
+ static bool mlRead(uint64_t lba, unsigned blocks, uint8_t *out) {
+-    IOReturn status = hostRead4k(4, lba, blocks, out);
++    IOReturn status = hostRead4k(ML_LUN, lba, blocks, out);
+     if (status != kIOReturnSuccess) native_macoslog_error = static_cast<uint32_t>(status);
+     return status == kIOReturnSuccess;
+ }
+ static bool mlOpen(uint8_t *scratch, uint64_t &first, uint64_t &generation) {
+     native_macoslog_phase = 1;
+     uint8_t *other = scratch + kDataMax;
+-    if (!mlRead(1, 1, scratch) || !mlRead(521215, 1, other) ||
+-        !mlGptHeader(scratch, false) || !mlGptHeader(other, true) ||
+-        memcmp(scratch + 40, other + 40, 32) || ml32(scratch + 88) != ml32(other + 88)) return false;
+-    uint32_t crc = ml32(scratch + 88);
+-    uint8_t header[92]; memcpy(header, scratch, sizeof(header));
+-    if (!mlRead(2, 3, scratch) || mlCrc(scratch, 96*128) != crc ||
+-        !mlGptEntries(scratch, header, mlPartitionId, mlTypeId) ||
+-        !mlRead(521211, 3, other) || memcmp(scratch, other, 96*128)) return false;
++    (void)mlPartitionId; (void)mlTypeId;
+     native_macoslog_phase = 2;
+     MlFat geometry;
+-    if (!mlRead(448512, 1, scratch) || !mlFatGeometry(scratch, geometry) ||
+-        !mlRead(448512 + geometry.reserved, geometry.fatBlocks, scratch) ||
+-        !mlRead(448512 + geometry.reserved + geometry.fatBlocks, geometry.fatBlocks, other) ||
++    if (!mlRead(ML_FAT_FIRST, 1, scratch) || !mlFatGeometry(scratch, geometry) ||
++        !mlRead(ML_FAT_FIRST + geometry.reserved, geometry.fatBlocks, scratch) ||
++        !mlRead(ML_FAT_FIRST + geometry.reserved + geometry.fatBlocks, geometry.fatBlocks, other) ||
+         memcmp(scratch, other, geometry.fatBlocks*4096) ||
+-        !mlRead(448512 + geometry.rootFirst, geometry.rootBlocks, other) ||
++        !mlRead(ML_FAT_FIRST + geometry.rootFirst, geometry.rootBlocks, other) ||
+         !mlFile(geometry, scratch, other, first)) return false;
+     native_macoslog_phase = 3;
+     if (!mlRead(first + 511, 1, other) || !mlGuard(other, first, mlFileId, mlPartitionId)) return false;
+@@ -82,7 +78,7 @@ static void mlThread(void *argument, wait_result_t) {
+             native_macoslog_phase = 4;
+             struct Ops {
+                 bool write(uint64_t lba, unsigned blocks, const void *data) {
+-                    IOReturn r = hostWrite4k(4, lba, blocks, data);
++                    IOReturn r = hostWrite4k(ML_LUN, lba, blocks, data);
+                     if (r != kIOReturnSuccess) native_macoslog_error = static_cast<uint32_t>(r);
+                     return r == kIOReturnSuccess;
+                 }
+diff --git a/scripts/build_macos26_storage.py b/scripts/build_macos26_storage.py
+index b0e04ef..c49eb5f 100644
+--- a/scripts/build_macos26_storage.py
++++ b/scripts/build_macos26_storage.py
+@@ -112,7 +112,7 @@ def build(root, out, compile_record, source, run, record, env, *, transport='vir
+     if transport == 'virtio':
+         command[1:1] = ['-DNATIVE_QEMU_SCRATCH_BLOCK=1']
+     else:
+-        command[1:1] = ['-DNATIVE_UFS_ROOT_PARTITION_NAME="macosroot"']
++        command[1:1] = ['-DNATIVE_UFS_ROOT_PARTITION_NAME="userdata"']
+     sdk = Path(subprocess.check_output(['xcrun', '--sdk', 'macosx', '--show-sdk-path'], text=True).strip())
+     command += ['-I', str(source / 'osfmk'), '-I', str(sdk / 'usr/include'),
+                 '-Wall', '-Wextra', '-Werror', '-Wno-unused-parameter',
+@@ -120,6 +120,40 @@ def build(root, out, compile_record, source, run, record, env, *, transport='vir
+                 '-Wno-deprecated-enum-enum-conversion', '-Wno-unnecessary-virtual-specifier']
+     run(command, directory + '-compile', record, cwd=Path(compile_record['directory']), env=env)
+     objects = [str(obj)]
++    # uke: the NT36532 touch panel as an absolute pointer (UKE_TOUCH_SRC = staged boot/macos-touch/src).
++    import os
++    touch = os.environ.get('UKE_TOUCH_SRC') if transport == 'ufs' else None
++    if touch:
++        touch = Path(touch)
++        cxx_only = {'-std=gnu++2b', '-fsized-deallocation', '-fapple-kext', '-fc++-static-destructors=none'}
++        for source in (touch / 'package/TouchProbe.cpp', touch / 'package/UkeTouchPointer.cpp',
++                       touch / 'drivers/NativeGeniSpi/GeniSpi.c', touch / 'drivers/NativeNovatekTouch/NvtProtocol.c',
++                       touch / 'drivers/NativeNovatekTouch/NvtTouchCore.c', touch / 'firmware.c'):
++            out_obj = destination / ('touch-' + source.stem + '.o')
++            c_mode = source.suffix == '.c'
++            extra = []
++            for arg in command:
++                if arg == str(wrapper):
++                    extra.append(str(source))
++                elif arg == str(obj):
++                    extra.append(str(out_obj))
++                elif c_mode and arg == '-xc++':
++                    extra.append('-xc')
++                elif c_mode and arg == '--driver-mode=g++':
++                    extra.append('--driver-mode=gcc')
++                elif c_mode and arg in cxx_only:
++                    continue
++                else:
++                    extra.append(arg)
++            extra += ['-Wno-error', '-I', str(touch / 'package')]
++            if source.name == 'UkeTouchPointer.cpp':
++                # Kernel HID headers; drop the user SDK include, as the recovery input companion does.
++                user = str(sdk / 'usr/include')
++                extra = [x for i, x in enumerate(extra) if not (x == user or (x == '-I' and i + 1 < len(extra) and extra[i + 1] == user))]
++                extra[1:1] = ['-I', str(touch / 'include')]
++                extra += ['-I', str(sdk / 'System/Library/Frameworks/Kernel.framework/Versions/A/Headers')]
++            run(extra, directory + '-touch-' + source.stem, record, cwd=Path(compile_record['directory']), env=env)
++            objects.append(str(out_obj))
+     if input_driver:
+         input_object = destination / 'recovery-input/NativeRecoveryInput.o'
+         input_command = [str(input_object) if arg == str(obj) else
+@@ -162,6 +196,11 @@ def build(root, out, compile_record, source, run, record, env, *, transport='vir
+                                   IOProviderClass='IOPlatformExpertDevice',
+                                   IOMatchCategory='NativeUfsRoot', IOProbeScore=500),
+         }
++    if transport == 'ufs' and touch:
++        info['IOKitPersonalities']['UkeTouchPointer'] = dict(
++            CFBundleIdentifier=bundle, IOClass='UkeTouchPointer', IOProviderClass='IOResources',
++            IOResourceMatch='IOKit', IOMatchCategory='UkeTouchPointer', IOProbeScore=500)
++        info['OSBundleLibraries']['com.apple.iokit.IOHIDFamily'] = '2.0.0'
+     if display:
+         info['IOKitPersonalities']['NativeGOPDisplay'] = dict(
+             CFBundleIdentifier=bundle, IOClass='NativeGOPDisplay',
+diff --git a/scripts/build_macos26_xnu.py b/scripts/build_macos26_xnu.py
+index 6270f9f..9d16f5e 100644
+--- a/scripts/build_macos26_xnu.py
++++ b/scripts/build_macos26_xnu.py
+@@ -90,6 +90,10 @@ PATCHES = [
+     ROOT / 'platform/sheng/macos26/patches/0064-native-language-chooser-trace.patch',
+     ROOT / 'platform/sheng/macos26/patches/0065-native-panic-framebuffer-owner.patch',
+     ROOT / 'platform/sheng/macos26/patches/0066-native-smp-progress.patch',
++    ROOT / 'platform/sheng/macos26/patches/0067-uke-windowserver-crash-report.patch',
++    ROOT / 'platform/sheng/macos26/patches/0068-uke-ui-page-trace.patch',
++    ROOT / 'platform/sheng/macos26/patches/0069-uke-unsealed-root.patch',
++    ROOT / 'platform/sheng/macos26/patches/0070-uke-critical-nopanic.patch',
+ ]
+ MACHINE_PATCH = ROOT / 'platform/sheng/macos26/patches/machine-driver-declarations.patch'
+ CPU_PATCH = ROOT / 'platform/sheng/macos26/patches/machine-cpu-registration.patch'
+@@ -620,7 +624,7 @@ def link_kernel(args, record, common, sdk, source, env):
+     kernel_bytes = binary.read_bytes()
+     for personality in (b"'IOClass'         = ArmDTPlatform;",
+                         b"'IOClass'         = ArmCpu;",
+-                        b"'IONameMatch'     = ( 'device-tree', 'xiaomi,sheng' );"):
++                        b"'IONameMatch'     = ( 'device-tree', 'xiaomi,sheng', 'xiaomi,uke' );"):
+         if personality not in kernel_bytes:
+             raise ValueError('linked kernel omitted a required SHENG platform personality')
+     record['native_platform_personalities_compiled'] = True
+diff --git a/scripts/native_log_file.py b/scripts/native_log_file.py
+index d255ed9..4b10d18 100644
+--- a/scripts/native_log_file.py
++++ b/scripts/native_log_file.py
+@@ -13,8 +13,8 @@ BLOCK, FILE_BYTES, SLOT_BYTES, SNAPSHOT_BYTES = 4096, 2 << 20, 1 << 20, 82048
+ 
+ 
+ def validate_contract(contract: dict) -> None:
+-    expected = dict(schema='sheng-macoslog-v1', lun=4, block_bytes=BLOCK, disk_blocks=521216,
+-        partition_index=78, partition_first=448512, partition_blocks=16384,
++    expected = dict(schema='sheng-macoslog-v1', lun=0, block_bytes=BLOCK, disk_blocks=30709760,
++        partition_index=32, partition_first=30693371, partition_blocks=16384,
+         partition_name='macoslog', fat_label='MACOSLOG', filename='SHENGLOG.BIN',
+         file_bytes=FILE_BYTES, slot_bytes=SLOT_BYTES, snapshot_bytes=SNAPSHOT_BYTES, period_ms=2000,
+         partition_uuid='4cd2ed34-2142-4ea4-abf2-ec6c51d117d7',
+diff --git a/scripts/native_storage_module.py b/scripts/native_storage_module.py
+index 2cf0c96..122c882 100644
+--- a/scripts/native_storage_module.py
++++ b/scripts/native_storage_module.py
+@@ -113,6 +113,7 @@ def prepare(directory: Path, base: int, native: dict, original: bytes,
+         display = evidence.get('native_gop_display')
+         input_driver = evidence.get('native_recovery_input')
+         allowed = {component, 'NativeGOPDisplay'} if display else {component}
++        allowed |= {'UkeTouchPointer'}   # uke touch panel pointer
+         if input_driver:
+             allowed |= {'NativeRecoveryInput', 'IOHIDEventDriver'}
+         if info['CFBundleExecutable'] != component or any(
+diff --git a/scripts/prepare_macos26_gop.py b/scripts/prepare_macos26_gop.py
+index c379d92..ef3c4dd 100644
+--- a/scripts/prepare_macos26_gop.py
++++ b/scripts/prepare_macos26_gop.py
+@@ -49,6 +49,11 @@ def prepare(root: Path, destination: Path) -> dict:
+         raise ValueError('paired framebuffer header adaptation is missing or changed')
+     source = destination / 'NativeGOPDisplay.cpp'
+     (destination / 'DroidVMDisplay.cpp').replace(source)
++    # uke: optional half-resolution mode (native-gop-scale=2) on top of the paired adaptation.
++    uke = root / 'platform/sheng/macos26/display/0002-uke-gop-scale.patch'
++    if uke.exists():
++        subprocess.run(['patch', '--batch', '--fuzz=0', '-p1', '-i', str(uke.resolve())],
++                       cwd=destination, check=True, capture_output=True, text=True)
+     scanout = root / 'platform/sheng/macos26/display/gop_scanout.h'
+     shutil.copyfile(scanout, destination / scanout.name)
+     layers = root / 'platform/sheng/macos26/display/gop_layers.h'
+-- 
+2.54.0 (Apple Git-157)
+

@@ -1,0 +1,42 @@
+--- a/osfmk/kern/bsd_kern.c
++++ b/osfmk/kern/bsd_kern.c
+@@ -1531,10 +1531,7 @@
+  * 30 times, after it executes, to see where it waits. Read-only: the process is never stopped or changed. A thread
+  * running in user mode shows its state from its last kernel entry.
+  */
+-struct proc;
+-extern struct proc *proc_find(int);
+-extern int proc_rele(struct proc *);
+-extern task_t proc_task(struct proc *);
++extern void *proc_find(int);   /* proc_rele and proc_task are declared at the top of this file */
+ 
+ #define UKE_SAMPLE_THREADS 12
+ #define UKE_SAMPLE_FRAMES 24
+@@ -1549,14 +1546,14 @@
+ {
+ 	thread_t threads[UKE_SAMPLE_THREADS];
+ 	unsigned count = 0;
+-	thread_t thread;
++	thread_t member;
+ 	task_lock(task);
+-	queue_iterate(&task->threads, thread, thread_t, task_threads) {
++	queue_iterate(&task->threads, member, thread_t, task_threads) {
+ 		if (count == UKE_SAMPLE_THREADS) {
+ 			break;
+ 		}
+-		thread_reference(thread);
+-		threads[count++] = thread;
++		thread_reference(member);
++		threads[count++] = member;
+ 	}
+ 	uint64_t image = task->mach_header_vm_address;
+ 	vm_map_t map = task->map;
+@@ -1609,7 +1606,7 @@
+ static void
+ uke_sample_tick(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+ {
+-	struct proc *p = proc_find(uke_sample_pid);
++	void *p = proc_find(uke_sample_pid);
+ 	if (!p) {
+ 		printf("UKE-SAMPLE: pid %d gone\n", uke_sample_pid);
+ 		return;

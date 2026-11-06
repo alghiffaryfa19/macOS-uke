@@ -1,0 +1,36 @@
+diff --git a/scripts/build-native-metal-bridge.py b/scripts/build-native-metal-bridge.py
+--- a/scripts/build-native-metal-bridge.py
++++ b/scripts/build-native-metal-bridge.py
+@@ -16,7 +16,7 @@
+ PIN = json.loads((ROOT / 'scripts/data/gpu-metal-vulkan-inputs.json').read_text())['translator']['commit']
+ SOURCE = ROOT / '.cache/gpu-reference/metal2vulkan'
+ parser = argparse.ArgumentParser(description=__doc__)
+-parser.add_argument('--target', choices=['ios', 'host'], default='ios')
++parser.add_argument('--target', choices=['ios', 'host', 'macos'], default='ios')
+ args = parser.parse_args()
+ if subprocess.check_output(['git', '-C', str(SOURCE), 'rev-parse', 'HEAD'], text=True).strip() != PIN:
+     raise SystemExit('Translator revision differs from the qualified source pin')
+@@ -78,15 +78,20 @@
+     'sha2 = { version = "0.10", features = ["asm"] }',
+     '[profile.release]', 'panic = "unwind"', 'debug = 1', '',
+ ]))
+-triple = 'aarch64-apple-ios' if args.target == 'ios' else 'aarch64-apple-darwin'
++# macos: arm64e for the uke's macOS 26.5 (WindowServer is arm64e); a tier-3 target, std built from rust-src.
++triple = {'ios': 'aarch64-apple-ios', 'host': 'aarch64-apple-darwin', 'macos': 'arm64e-apple-darwin'}[args.target]
+ # The translator source the runtime is built from (its pin and recorded patches), which keys the shader cache (PrimeShaders.h).
+ runtime_id = hashlib.sha256((PIN + '\n' + states[-1]).encode()).hexdigest()[:32]
+-env = dict(os.environ, NMB_RUNTIME_ID=runtime_id, NMB_FIXTURE_AIR=str(air), NMB_FC_AIR=str(fc_air), IPHONEOS_DEPLOYMENT_TARGET='17.0', MACOSX_DEPLOYMENT_TARGET='14.0')
++env = dict(os.environ, NMB_RUNTIME_ID=runtime_id, NMB_FIXTURE_AIR=str(air), NMB_FC_AIR=str(fc_air), IPHONEOS_DEPLOYMENT_TARGET='17.0',
++           MACOSX_DEPLOYMENT_TARGET='26.5' if args.target == 'macos' else '14.0')
++build_std = ['-Zbuild-std=std,panic_unwind'] if args.target == 'macos' else []
++if build_std:
++    env['RUSTC_BOOTSTRAP'] = '1'
+ target_dir = ROOT / 'build/m2v-target'
+ log = out / ('build-%s.log' % args.target)
+ with log.open('w') as stream:
+     result = subprocess.run(['cargo', '+1.98.0', 'build', '--release', '--manifest-path', manifest, '--target', triple,
+-                             '--target-dir', target_dir], env=env, stdout=stream, stderr=subprocess.STDOUT, timeout=1800)
++                             *build_std, '--target-dir', target_dir], env=env, stdout=stream, stderr=subprocess.STDOUT, timeout=1800)
+ if result.returncode:
+     raise SystemExit(log.read_text()[-6000:])
+ library = target_dir / triple / 'release/libnative_metal_bridge.a'

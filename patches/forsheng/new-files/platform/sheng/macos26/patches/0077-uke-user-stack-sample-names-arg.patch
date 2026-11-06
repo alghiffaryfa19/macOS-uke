@@ -1,0 +1,174 @@
+--- a/osfmk/kern/bsd_kern.c
++++ b/osfmk/kern/bsd_kern.c
+@@ -1527,8 +1527,9 @@
+ #include <pexpert/pexpert.h>
+ 
+ /*
+- * uke: with boot-arg uke-sample=1, log the user frame-pointer stacks of the threads of "Language Chooser" every 20 s,
+- * 30 times, after it executes, to see where it waits. Read-only: the process is never stopped or changed. A thread
++ * uke: log the user frame-pointer stacks of the threads of named processes every 20 s, 30 times, after they execute,
++ * to see where they wait. boot-arg uke-sample-name=Dock,SystemUIServer (up to 4 comma-separated process names);
++ * uke-sample=1 alone samples "Language Chooser". Read-only: the process is never stopped or changed. A thread
+  * running in user mode shows its state from its last kernel entry.
+  */
+ extern void *proc_find(int);   /* proc_rele and proc_task are declared at the top of this file */
+@@ -1537,12 +1538,19 @@
+ #define UKE_SAMPLE_FRAMES 24
+ #define UKE_SAMPLE_MASK 0x7fffffffffULL
+ 
+-static thread_call_t uke_sample_call;
+-static int uke_sample_pid;
+-static unsigned uke_sample_rounds;
++#define UKE_SAMPLE_SLOTS 4
++struct uke_sample_slot {
++	char name[17];          /* p_comm: MAXCOMLEN + 1 */
++	int pid;
++	unsigned rounds;
++	thread_call_t call;
++};
++static struct uke_sample_slot uke_sample_slots[UKE_SAMPLE_SLOTS];
++static unsigned uke_sample_slot_count;
++static uint32_t uke_sample_state;   /* 0 boot-args not read, 1 reading, 2 ready */
+ 
+ static void
+-uke_sample_task(task_t task)
++uke_sample_task(task_t task, const struct uke_sample_slot *slot)
+ {
+ 	thread_t sampled[UKE_SAMPLE_THREADS];
+ 	unsigned count = 0;
+@@ -1569,7 +1577,7 @@
+ 		}
+ 		vm_shared_region_deallocate(region);
+ 	}
+-	printf("UKE-SAMPLE: pid %d round %u image 0x%llx cache slide 0x%llx threads %u\n", uke_sample_pid, uke_sample_rounds,
++	printf("UKE-SAMPLE: %s pid %d round %u image 0x%llx cache slide 0x%llx threads %u\n", slot->name, slot->pid, slot->rounds,
+ 	    image_base, cache_slide, count);
+ 	for (unsigned i = 0; i < count; i++) {
+ 		struct arm_saved_state *ss = get_user_regs(sampled[i]);
+@@ -1577,7 +1585,7 @@
+ 			continue;
+ 		}
+ 		uint64_t fp = get_saved_state_fp(ss);
+-		printf("UKE-SAMPLE: t%u tid %llu state 0x%x pc 0x%llx lr 0x%llx\n", i, thread_tid(sampled[i]), sampled[i]->state,
++		printf("UKE-SAMPLE: %d t%u tid %llu state 0x%x pc 0x%llx lr 0x%llx\n", slot->pid, i, thread_tid(sampled[i]), sampled[i]->state,
+ 		    get_saved_state_pc(ss) & UKE_SAMPLE_MASK, get_saved_state_lr(ss) & UKE_SAMPLE_MASK);
+ 		uint64_t frames[UKE_SAMPLE_FRAMES];
+ 		unsigned depth = 0;
+@@ -1593,7 +1601,7 @@
+ 			fp = frame[0];
+ 		}
+ 		for (unsigned f = 0; f < depth; f += 4) {
+-			printf("UKE-SAMPLE: t%u #%u 0x%llx 0x%llx 0x%llx 0x%llx\n", i, f, frames[f],
++			printf("UKE-SAMPLE: %d t%u #%u 0x%llx 0x%llx 0x%llx 0x%llx\n", slot->pid, i, f, frames[f],
+ 			    f + 1 < depth ? frames[f + 1] : 0, f + 2 < depth ? frames[f + 2] : 0, f + 3 < depth ? frames[f + 3] : 0);
+ 		}
+ 	}
+@@ -1604,47 +1612,82 @@
+ }
+ 
+ static void
+-uke_sample_tick(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
+-{
+-	printf("UKE-SAMPLE: tick pid %d round %u\n", uke_sample_pid, uke_sample_rounds);
+-	void *p = proc_find(uke_sample_pid);
++uke_sample_tick(thread_call_param_t p0, __unused thread_call_param_t p1)
++{
++	struct uke_sample_slot *slot = &uke_sample_slots[(uintptr_t)p0];
++	void *p = proc_find(slot->pid);
+ 	if (!p) {
+-		printf("UKE-SAMPLE: pid %d gone\n", uke_sample_pid);
++		printf("UKE-SAMPLE: %s pid %d gone\n", slot->name, slot->pid);
+ 		return;
+ 	}
+-	uke_sample_task(proc_task(p));
++	uke_sample_task(proc_task(p), slot);
+ 	proc_rele(p);
+-	if (++uke_sample_rounds < 30) {
++	if (++slot->rounds < 30) {
+ 		uint64_t deadline;
+ 		nanoseconds_to_absolutetime(20ULL * NSEC_PER_SEC, &deadline);
+-		thread_call_enter_delayed(uke_sample_call, mach_absolute_time() + deadline);
++		thread_call_enter_delayed(slot->call, mach_absolute_time() + deadline);
+ 	}
+ }
+ 
++static void
++uke_sample_read_names(void)
++{
++	char list[96] = {};
++	unsigned enabled = 0;
++	if (!PE_parse_boot_arg_str("uke-sample-name", list, sizeof(list))) {
++		if (!PE_parse_boot_argn("uke-sample", &enabled, sizeof(enabled)) || !enabled) {
++			return;
++		}
++		strlcpy(list, "Language Chooser", sizeof(list));
++	}
++	for (char *name = list; *name && uke_sample_slot_count < UKE_SAMPLE_SLOTS;) {
++		char *end = name;
++		while (*end && *end != ',') {
++			end++;
++		}
++		bool last = !*end;
++		*end = 0;
++		if (*name) {
++			strlcpy(uke_sample_slots[uke_sample_slot_count++].name, name, sizeof(uke_sample_slots[0].name));
++			printf("UKE-SAMPLE: will sample %s\n", name);
++		}
++		if (last) {
++			break;
++		}
++		name = end + 1;
++	}
++}
++
+ void uke_sample_exec(const char *comm, int pid);
+ void
+ uke_sample_exec(const char *comm, int pid)
+ {
+-	unsigned enabled = 0;
+-	if (strcmp(comm, "Language Chooser")) {
+-		return;
++	if (os_atomic_load(&uke_sample_state, acquire) != 2) {
++		if (!os_atomic_cmpxchg(&uke_sample_state, 0, 1, acq_rel)) {
++			return;   /* another exec is reading the boot-args; a process started meanwhile is not sampled */
++		}
++		uke_sample_read_names();
++		os_atomic_store(&uke_sample_state, 2, release);
+ 	}
+-	bool found = PE_parse_boot_argn("uke-sample", &enabled, sizeof(enabled));
+-	printf("UKE-SAMPLE: exec match %s pid %d boot-arg %d value %u\n", comm, pid, found, enabled);
+-	if (!found || !enabled) {
++	for (unsigned i = 0; i < uke_sample_slot_count; i++) {
++		struct uke_sample_slot *slot = &uke_sample_slots[i];
++		if (strcmp(comm, slot->name)) {
++			continue;
++		}
++		if (!slot->call) {
++			slot->call = thread_call_allocate_with_options(uke_sample_tick, (thread_call_param_t)(uintptr_t)i,
++			    THREAD_CALL_PRIORITY_KERNEL, 0);
++			if (!slot->call) {
++				return;
++			}
++		}
++		slot->pid = pid;
++		slot->rounds = 0;
++		printf("UKE-SAMPLE: armed for %s pid %d\n", comm, pid);
++		uint64_t deadline;
++		nanoseconds_to_absolutetime(20ULL * NSEC_PER_SEC, &deadline);
++		thread_call_enter_delayed(slot->call, mach_absolute_time() + deadline);
+ 		return;
+ 	}
+-	if (!uke_sample_call) {
+-		uke_sample_call = thread_call_allocate_with_options(uke_sample_tick, NULL, THREAD_CALL_PRIORITY_KERNEL, 0);
+-		if (!uke_sample_call) {
+-			return;
+-		}
+-	}
+-	uke_sample_pid = pid;
+-	uke_sample_rounds = 0;
+-	printf("UKE-SAMPLE: armed for %s pid %d\n", comm, pid);
+-	uint64_t deadline;
+-	nanoseconds_to_absolutetime(20ULL * NSEC_PER_SEC, &deadline);
+-	thread_call_enter_delayed(uke_sample_call, mach_absolute_time() + deadline);
+ }
+ #endif /* SHENG */

@@ -1,0 +1,42 @@
+diff --git a/package/GpuPowerProbe.cpp b/package/GpuPowerProbe.cpp
+index f9ecb47..ea3067c 100644
+--- a/package/GpuPowerProbe.cpp
++++ b/package/GpuPowerProbe.cpp
+@@ -125,13 +125,13 @@ extern "C" volatile uint32_t native_adreno_trace_stage;
+ extern "C" volatile uint32_t native_adreno_open_log_count;
+ extern "C" int proc_iterate(unsigned flags, int (*callout)(void *, void *), void *arg, int (*filter)(void *, void *), void *filterarg);
+ extern "C" const char *proc_name_address(void *p);
+-extern "C" volatile uint64_t armcpu_ipi_interrupts __attribute__((weak));
+-extern "C" volatile uint64_t armcpu_ipi_sent __attribute__((weak));
++extern "C" volatile uint64_t armcpu_ipi_interrupts;
++extern "C" volatile uint64_t armcpu_ipi_sent;
+ extern "C" volatile uint64_t armcpu_ipi_selftest_sent __attribute__((weak));
+-extern "C" void armcpu_ipi_selftest(uint64_t aff) __attribute__((weak));
++extern "C" void armcpu_ipi_selftest(uint64_t aff);
+ extern "C" void armcpu_gic_diag(uint64_t aff, uint32_t *out) __attribute__((weak));
+ extern "C" volatile uint32_t armcpu_gic_diag_stage __attribute__((weak));
+-extern "C" void armcpu_sgi_selfprobe(uint64_t *out) __attribute__((weak));
++extern "C" void armcpu_sgi_selfprobe(uint64_t *out);
+ extern "C" volatile uint32_t armcpu_core_timer[8], armcpu_core_sgi[8], armcpu_gic_boot[8];
+ extern "C" IOService *native_adreno_published_service() __attribute__((weak));
+ extern "C" volatile uint32_t native_adreno_wc_enabled, native_adreno_owned_coherent;
+@@ -582,7 +582,7 @@ extern "C" {
+ int32_t native_gpu_zap[8];
+ // per SMC (init, mem_setup, auth): milliseconds and INTERRUPTED resumes; free pages before the zap and 2 s after its last step
+ uint32_t native_gpu_zap_cost[6], native_gpu_zap_free[2];
+-extern unsigned int vm_page_free_count __attribute__((weak));
++extern unsigned int vm_page_free_count;
+ }
+ uint32_t rd32le(const uint8_t *p) {return uint32_t(p[0]) | uint32_t(p[1]) << 8 | uint32_t(p[2]) << 16 | uint32_t(p[3]) << 24;}
+ uint16_t rd16le(const uint8_t *p) {return uint16_t(p[0] | p[1] << 8);}
+@@ -696,8 +696,8 @@ extern "C" {
+ // GPU interrupt (row 3): attach status, GICD readback, handled interrupts, OR of the INT_0_STATUS words they cleared
+ uint32_t native_gpu_irq[6];
+ IOReturn armcpu_spi_attach(uint32_t intid, bool edge, void (*handler)(void *), void *context, uint32_t *readback,
+-                           uint64_t *router) __attribute__((weak));
+-extern volatile uint64_t armcpu_spi_unhandled __attribute__((weak));
++                           uint64_t *router);
++extern volatile uint64_t armcpu_spi_unhandled;
+ }
+ volatile uint32_t gIrqLast, gIrqSeen, gIrqEmpty;
+ void gpuIrq(void *) {

@@ -1,0 +1,18 @@
+--- a/iokit/Kernel/IOPlatformExpert.cpp
++++ b/iokit/Kernel/IOPlatformExpert.cpp
+@@ -1411,7 +1411,15 @@
+ 	*secs = 0;
+ 	if (gIOPlatform) {
+ 		gIOPlatform->getUTCTimeOfDay(secs, &nsecs);
++	}
++#if SHENG
++	/* uke has no RTC driver: start the calendar at boot-arg uke-epoch (Unix seconds, the image build time). */
++	uint64_t uke_epoch = 0;
++	if (*secs < 1000000000 && PE_parse_boot_argn("uke-epoch", &uke_epoch, sizeof(uke_epoch)) && uke_epoch) {
++		*secs = (clock_sec_t)uke_epoch;
++		nsecs = 0;
+ 	}
++#endif
+ 
+ 	assert(nsecs < NSEC_PER_SEC);
+ 	*usecs = nsecs / NSEC_PER_USEC;

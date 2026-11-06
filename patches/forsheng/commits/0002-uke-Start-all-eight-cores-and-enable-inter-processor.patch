@@ -1,0 +1,687 @@
+From e4c8afd8620666d380bc2c2b837c572ad2916d3b Mon Sep 17 00:00:00 2001
+From: iOSNJBrepo <42407902+iOSNJBrepo@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 19:47:46 +0100
+Subject: [PATCH 2/2] uke: Start all eight cores and enable inter-processor
+ interrupts
+
+Secondary cores intermittently took a synchronous external abort on
+their first fetch at a kernel address (arm_init_tramp). common_start
+reads cpu_ttep with the MMU and caches off, and ArmCpu never cleaned it
+to memory before PSCI CPU_ON, so a core could load a stale TTBR1 root.
+Clean it with the other early-boot data.
+
+With the cores starting reliably, armcpu-self-ipi=1 delivers IPIs on all
+eight cores. The new self-IPI mode 2 (secondaries signal the boot core)
+stays opt-in; the default remains off.
+
+Add a per-core entry trace (sheng_smp_entry) from the reset vector to
+arm_init_cpu, shown in the SHENG-SMP log. A secondary keeps the V=P
+vectors until arm_init_tramp has run, so an early fault is recorded and
+an instruction-fetch external abort is retried.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ platform/sheng/macos26/log/early_exception.h  |   2 +
+ platform/sheng/macos26/log/smp_log.h          |  63 +++++-
+ platform/sheng/macos26/pac/smp_entry.h        | 139 ++++++++++++
+ .../patches/0071-uke-smp-entry-trace.patch    | 204 ++++++++++++++++++
+ .../patches/0072-uke-smp-entry-faults.patch   |  42 ++++
+ .../machine-cpu-uke-boot-ipi-late.patch       |  51 +++++
+ .../patches/machine-cpu-uke-clean-ttep.patch  |  20 ++
+ scripts/build_macos26_xnu.py                  |  13 +-
+ 8 files changed, 529 insertions(+), 5 deletions(-)
+ create mode 100644 platform/sheng/macos26/pac/smp_entry.h
+ create mode 100644 platform/sheng/macos26/patches/0071-uke-smp-entry-trace.patch
+ create mode 100644 platform/sheng/macos26/patches/0072-uke-smp-entry-faults.patch
+ create mode 100644 platform/sheng/macos26/patches/machine-cpu-uke-boot-ipi-late.patch
+ create mode 100644 platform/sheng/macos26/patches/machine-cpu-uke-clean-ttep.patch
+
+diff --git a/platform/sheng/macos26/log/early_exception.h b/platform/sheng/macos26/log/early_exception.h
+index 03ca922..1c8bf06 100644
+--- a/platform/sheng/macos26/log/early_exception.h
++++ b/platform/sheng/macos26/log/early_exception.h
+@@ -32,6 +32,8 @@ Lsheng_early_enter:
+ 
+ Lsheng_early_exception:
+ 	msr DAIFSet, #15
++	/* uke: a secondary core records its own fault, with the MMU on or off, and parks (sheng_smp_entry.h). */
++	SHENG_SMP_EXCEPTION
+ 	/* Use V=P vectors for the first MMU transition without high mappings or an exception stack. */
+ 	mrs x0, SCTLR_EL1
+ 	tbnz x0, #0, EXT(sheng_mmu_sync_fault)
+diff --git a/platform/sheng/macos26/log/smp_log.h b/platform/sheng/macos26/log/smp_log.h
+index 55e34bb..2092a94 100644
+--- a/platform/sheng/macos26/log/smp_log.h
++++ b/platform/sheng/macos26/log/smp_log.h
+@@ -6,10 +6,27 @@ extern volatile int32_t armcpu_smp_psci_rc[8];
+ extern volatile uint32_t armcpu_smp_mpidr[8], armcpu_smp_seen_mpidr[8];
+ extern volatile uint32_t armcpu_core_timer[8], armcpu_core_sgi[8];
+ extern volatile uint64_t armcpu_ipi_sent, armcpu_ipi_interrupts;
++/* uke: osfmk/arm64/sheng_smp_entry.h, written by the secondaries partly with the MMU off. */
++extern volatile uint64_t sheng_smp_entry[64];
+ unsigned sheng_smp_log_cpus;
+ static uint32_t sheng_smp_log_writer;
+ static uint64_t sheng_smp_log_reported;
+-static uint32_t sheng_smp_log_valid, sheng_smp_log_previous[8][3];
++static uint32_t sheng_smp_log_valid, sheng_smp_log_previous[8][4];
++
++/* A secondary writes its line non-cacheable before its MMU is on: drop any copy this core holds first. */
++static uint64_t sheng_smp_entry_read(unsigned cpu, unsigned field)
++{
++    volatile uint64_t *line = &sheng_smp_entry[cpu * 8];
++    __asm__ volatile ("dc civac, %0\n\tdsb sy" :: "r" (line) : "memory");
++    return line[field];
++}
++
++/* The boot CPU's own stage 1 translation of va (PAR_EL1) and its TTBR1, to compare with a secondary's fault. */
++static void sheng_smp_boot_translate(uint64_t va, uint64_t *par, uint64_t *ttbr1)
++{
++    __asm__ volatile ("at s1e1r, %2\n\tisb\n\tmrs %0, par_el1\n\tmrs %1, ttbr1_el1"
++        : "=r" (*par), "=r" (*ttbr1) : "r" (va) : "memory");
++}
+ 
+ static void sheng_smp_field(char *line, unsigned *n, const char *name, uint64_t value)
+ {
+@@ -32,13 +49,14 @@ static void sheng_smp_log_tick(void)
+     if (!__atomic_compare_exchange_n(&sheng_smp_log_writer, &expected, 1, 0,
+         __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) return;
+     uint64_t now = sheng_boot_progress_seconds();
+-    uint32_t state[8][3];
++    uint32_t state[8][4];
+     int changed = !sheng_smp_log_valid;
+     for (unsigned cpu = 0; cpu < sheng_smp_log_cpus; cpu++) {
+         state[cpu][0] = __atomic_load_n(&armcpu_smp_step[cpu], __ATOMIC_RELAXED);
+         state[cpu][1] = __atomic_load_n(&armcpu_smp_fail[cpu], __ATOMIC_RELAXED);
+         state[cpu][2] = (uint32_t)__atomic_load_n(&armcpu_smp_psci_rc[cpu], __ATOMIC_RELAXED);
+-        for (unsigned i = 0; i < 3; i++) changed |= state[cpu][i] != sheng_smp_log_previous[cpu][i];
++        state[cpu][3] = (uint32_t)sheng_smp_entry_read(cpu, 0);
++        for (unsigned i = 0; i < 4; i++) changed |= state[cpu][i] != sheng_smp_log_previous[cpu][i];
+     }
+     if (!changed && (now < sheng_smp_log_reported || now - sheng_smp_log_reported < 30)) {
+         __atomic_store_n(&sheng_smp_log_writer, 0, __ATOMIC_RELEASE);
+@@ -77,7 +95,44 @@ static void sheng_smp_log_tick(void)
+         sheng_smp_field(line, &n, " timer=", __atomic_load_n(&armcpu_core_timer[cpu], __ATOMIC_RELAXED));
+         sheng_smp_field(line, &n, " ipi=", __atomic_load_n(&armcpu_core_sgi[cpu], __ATOMIC_RELAXED));
+         sheng_smp_emit(line);
+-        for (unsigned i = 0; i < 3; i++) sheng_smp_log_previous[cpu][i] = state[cpu][i];
++        if (cpu != 0) {
++            /* entry: 1-12 assembly (reset vector .. trampoline; x0 = trampoline KVA), 16-22 arm_init_cpu, 224 reset handler gave up, 238 exception. */
++            n = 0;
++            sheng_smp_field(line, &n, "cpu=", cpu);
++            sheng_smp_field(line, &n, " entry=", state[cpu][3]);
++            sheng_smp_field(line, &n, " el=", sheng_smp_entry_read(cpu, 5) >> 2);
++            sheng_smp_field(line, &n, " sctlr=", sheng_smp_entry_read(cpu, 6));
++            sheng_smp_field(line, &n, " x0=", sheng_smp_entry_read(cpu, 7));
++            sheng_smp_emit(line);
++            /* A fault is kept once recorded: the core may have retried past it (retries = field 7). */
++            if (sheng_smp_entry_read(cpu, 1) != 0) {
++                n = 0;
++                sheng_smp_field(line, &n, "cpu=", cpu);
++                sheng_smp_field(line, &n, " fault-at=", sheng_smp_entry_read(cpu, 4));
++                sheng_smp_field(line, &n, " esr=", sheng_smp_entry_read(cpu, 1));
++                sheng_smp_field(line, &n, " elr=", sheng_smp_entry_read(cpu, 2));
++                sheng_smp_field(line, &n, " retries=", sheng_smp_entry_read(cpu, 7));
++                sheng_smp_emit(line);
++                const uint64_t far = sheng_smp_entry_read(cpu, 3);
++                n = 0;
++                sheng_smp_field(line, &n, "cpu=", cpu);
++                sheng_smp_field(line, &n, " far=", far);
++                sheng_smp_field(line, &n, " parked-esr=", sheng_smp_entry_read(cpu, 5));
++                sheng_smp_emit(line);
++                uint64_t boot_par, boot_ttbr1;
++                sheng_smp_boot_translate(far, &boot_par, &boot_ttbr1);
++                n = 0;
++                sheng_smp_field(line, &n, "cpu=", cpu);
++                sheng_smp_field(line, &n, " ttbr1=", sheng_smp_entry_read(cpu, 6));
++                sheng_smp_field(line, &n, " boot-ttbr1=", boot_ttbr1);
++                sheng_smp_emit(line);
++                n = 0;
++                sheng_smp_field(line, &n, "cpu=", cpu);
++                sheng_smp_field(line, &n, " boot-par=", boot_par);
++                sheng_smp_emit(line);
++            }
++        }
++        for (unsigned i = 0; i < 4; i++) sheng_smp_log_previous[cpu][i] = state[cpu][i];
+     }
+     __atomic_store_n(&sheng_smp_log_writer, 0, __ATOMIC_RELEASE);
+ }
+diff --git a/platform/sheng/macos26/pac/smp_entry.h b/platform/sheng/macos26/pac/smp_entry.h
+new file mode 100644
+index 0000000..d6ee0c7
+--- /dev/null
++++ b/platform/sheng/macos26/pac/smp_entry.h
+@@ -0,0 +1,139 @@
++// SPDX-License-Identifier: GPL-3.0-or-later
++// uke: where each secondary core got to on its way from PSCI CPU_ON to ArmCpu::initCPU.
++// One 64-byte line per core, indexed by MPIDR Aff1 (the core number on SM7675):
++//   [0] last stage reached   [8] ESR   [16] ELR   [24] FAR   [32] stage when the exception hit
++//   [40] CurrentEL at entry (after an exception: the ESR of the exception that parked the core, 0 if none)
++//   [48] SCTLR_EL1 at entry (TTBR1_EL1 after an exception)   [56] x0 when the reset handler gave up
++// Stages 1-12 are written from assembly, before and after the MMU is enabled (12: arrived in arm_init_tramp,
++// 11: phystokv returned there); 16-22 from arm_init_cpu. Field [56] also holds the trampoline address from stage 10.
++// A secondary keeps the V=P vectors until stage 11, so a fault anywhere before it is recorded as stage 0xee.
++// Before the MMU is on the stores are non-cacheable, so the reader invalidates each line first.
++// Initialized data survives arm_init's BSS clearing.
++.data
++.p2align 6
++.globl EXT(sheng_smp_entry)
++EXT(sheng_smp_entry):
++    .space 512, 0
++.text
++
++.macro SHENG_SMP_ENTRY_LINE
++    mrs x16, MPIDR_EL1
++    ubfx x16, x16, #8, #3
++#ifdef __APPLE__
++    adrp x17, EXT(sheng_smp_entry)@page
++    add x17, x17, EXT(sheng_smp_entry)@pageoff
++#else
++    adrp x17, EXT(sheng_smp_entry)
++    add x17, x17, :lo12:EXT(sheng_smp_entry)
++#endif
++    add x17, x17, x16, lsl #6
++.endmacro
++
++// Secondary-only paths (reset vector, start_cpu). Clobbers x16 and x17.
++.macro SHENG_SMP_MARK stage
++    SHENG_SMP_ENTRY_LINE
++    mov x16, #\stage
++    str x16, [x17]
++    dsb sy
++.endmacro
++
++// Paths shared with the cold boot CPU (common_start): only a warm start (x21 != 0) records.
++.macro SHENG_SMP_MARK_WARM stage
++    cbz x21, 9f
++    SHENG_SMP_MARK \stage
++9:
++.endmacro
++
++// First instructions of the reset vector: also record the exception level and SCTLR the core was started with.
++.macro SHENG_SMP_MARK_ENTRY
++    SHENG_SMP_ENTRY_LINE
++    mrs x16, CurrentEL
++    str x16, [x17, #40]
++    mrs x16, SCTLR_EL1
++    str x16, [x17, #48]
++    mov x16, #1
++    str x16, [x17]
++    dsb sy
++.endmacro
++
++// Ltrampoline: keep the kernel virtual address it is about to branch to (field [56]).
++.macro SHENG_SMP_RECORD_X0
++    SHENG_SMP_ENTRY_LINE
++    str x0, [x17, #56]
++    dsb sy
++.endmacro
++
++// The reset handler found no cpu data for this MPIDR, or an unexpected handler: keep x0 and stop.
++.macro SHENG_SMP_MARK_GAVE_UP
++    SHENG_SMP_ENTRY_LINE
++    str x0, [x17, #56]
++    mov x16, #0xe0
++    str x16, [x17]
++    dsb sy
++.endmacro
++
++// An early exception on a secondary (Aff1 != 0): record the first one, leaving the boot CPU's shared exception
++// record alone. An external abort on instruction fetch (EC 0x21, IFSC 0x10; seen intermittently on the first
++// fetch at the arm_init_tramp KVA) is retried up to 1024 times after invalidating the TLB and icache, counting in
++// field [56]; anything else, or too many retries, parks the core at stage 0xee. Falls through for the boot CPU.
++// Clobbers x16, x17 and NZCV; ERET restores PSTATE.
++.macro SHENG_SMP_EXCEPTION
++    mrs x16, MPIDR_EL1
++    ubfx x16, x16, #8, #3
++    cbz x16, 9f
++    SHENG_SMP_ENTRY_LINE
++    ldr x16, [x17, #8]
++    cbnz x16, 6f
++    ldr x16, [x17]
++    str x16, [x17, #32]
++    mrs x16, ESR_EL1
++    str x16, [x17, #8]
++    mrs x16, ELR_EL1
++    str x16, [x17, #16]
++    mrs x16, FAR_EL1
++    str x16, [x17, #24]
++    // The table this core walked (replaces the entry-time SCTLR). No AT here: on a secondary it raised a second
++    // exception before anything after it was stored (log F18).
++    mrs x16, TTBR1_EL1
++    str x16, [x17, #48]
++    str xzr, [x17, #40]
++    str xzr, [x17, #56]
++6:
++    mrs x16, ESR_EL1
++    ubfx x16, x16, #26, #6
++    cmp x16, #0x21
++    b.ne 7f
++    mrs x16, ESR_EL1
++    and x16, x16, #0x3f
++    cmp x16, #0x10
++    b.ne 7f
++    ldr x16, [x17, #56]
++    add x16, x16, #1
++    str x16, [x17, #56]
++    cmp x16, #1024
++    b.hs 7f
++    mov x16, #0xee
++    str x16, [x17]
++    dsb sy
++    tlbi vmalle1
++    dsb ish
++    ic iallu
++    dsb ish
++    isb
++    mov x16, #0x10000
++5:
++    subs x16, x16, #1
++    b.ne 5b
++    eret
++7:
++    // Not retried: keep this exception's ESR next to the first one (replaces the entry-time EL).
++    mrs x16, ESR_EL1
++    str x16, [x17, #40]
++    mov x16, #0xee
++    str x16, [x17]
++    dsb sy
++8:
++    wfe
++    b 8b
++9:
++.endmacro
+diff --git a/platform/sheng/macos26/patches/0071-uke-smp-entry-trace.patch b/platform/sheng/macos26/patches/0071-uke-smp-entry-trace.patch
+new file mode 100644
+index 0000000..1e639d8
+--- /dev/null
++++ b/platform/sheng/macos26/patches/0071-uke-smp-entry-trace.patch
+@@ -0,0 +1,204 @@
++--- a/osfmk/arm64/start.s
+++++ b/osfmk/arm64/start.s
++@@ -41,6 +41,9 @@
++ #include <arm64/sheng_smp_keys_storage.h>
++ #endif
++ #include <arm64/sheng_bootstrap_trace.h>
+++#if SHENG
+++#include <arm64/sheng_smp_entry.h>
+++#endif
++ 
++ #if __ARM_KERNEL_PROTECT__
++ #include <arm/pmap.h>
++@@ -137,6 +140,9 @@
++ 	msr		OSLAR_EL1, xzr
++ #endif
++ 	msr		DAIFSet, #(DAIFSC_ALL)				// Disable all interrupts
+++#if SHENG
+++	SHENG_SMP_MARK_ENTRY
+++#endif
++ 
++ #if !(defined(KERNEL_INTEGRITY_KTRR) || defined(KERNEL_INTEGRITY_CTRR) || defined(KERNEL_INTEGRITY_PV_CTRR))
++ 	// Set low reset vector before attempting any loads
++@@ -170,6 +176,9 @@
++ 	b.eq	Lskip_cpu_reset_handler				// Not found
++ 	b		Lcheck_cpu_data_entry	// loop
++ Lfound_cpu_data_entry:
+++#if SHENG
+++	SHENG_SMP_MARK 2
+++#endif
++ 
++ #ifdef APPLEEVEREST
++ 	/*
++@@ -208,8 +217,14 @@
++ 	msr		TPIDR_EL1, x13
++ #endif /* __ARM_KERNEL_PROTECT__ */
++ 
+++#if SHENG
+++	SHENG_SMP_MARK 3
+++#endif
++ 	blr		x0
++ Lskip_cpu_reset_handler:
+++#if SHENG
+++	SHENG_SMP_MARK_GAVE_UP
+++#endif
++ 	b		.									// Hang if the handler is NULL or returns
++ 
++ 	.align 3
++@@ -323,6 +338,9 @@
++ 
++ 	.align 2
++ start_cpu:
+++#if SHENG
+++	SHENG_SMP_MARK 4
+++#endif
++ #if defined(KERNEL_INTEGRITY_KTRR) || defined(KERNEL_INTEGRITY_CTRR) || defined(KERNEL_INTEGRITY_PV_CTRR)
++ 	// This is done right away in reset vector for pre-KTRR devices
++ 	// Set low reset vector now that we are in the KTRR-free zone
++@@ -692,6 +710,9 @@
++  *	TPIDRRO_EL0 - CPU number
++  */
++ common_start:
+++#if SHENG
+++	SHENG_SMP_MARK_WARM 5
+++#endif
++ 
++ #if HAS_NEX_PG
++ 	mov x19, lr
++@@ -772,6 +793,9 @@
++ 	ic		iallu
++ #endif
++ 	SHENG_BOOTSTRAP_TRACE 11
+++#if SHENG
+++	SHENG_SMP_MARK_WARM 6
+++#endif
++ 
++ 
++ 	/* If x21 is not 0, then this is either the start_cpu path or
++@@ -784,6 +808,9 @@
++ 	add		x0, x0, EXT(cpu_ttep)@pageoff
++ 	ldr		x0, [x0]
++ 	MSR_TTBR1_EL1_X0
+++#if SHENG
+++	SHENG_SMP_MARK 7
+++#endif
++ 1:
++ 
++ 	// Set up the exception vectors
++@@ -814,6 +841,9 @@
++ 
++ 	// Enable caches, MMU, ROP and JOP
++ 	MOV64   x0, SCTLR_EL1_DEFAULT
+++#if SHENG
+++	SHENG_SMP_MARK_WARM 8
+++#endif
++ 	SHENG_BOOTSTRAP_TRACE 12
++ 
++ 	MSR_SCTLR_EL1_X0
++@@ -823,7 +853,10 @@
++ 	msr		VBAR_EL1, x28
++ 	isb
++ 	SHENG_BOOTSTRAP_TRACE 14
+++#if SHENG
+++	SHENG_SMP_MARK_WARM 9
++ #endif
+++#endif
++ 
++ #if !VMAPPLE
++ 	MOV64	x1, SCTLR_EL1_DEFAULT
++@@ -901,6 +934,9 @@
++ 	ret
++ 
++ Ltrampoline:
+++#if SHENG
+++	SHENG_SMP_MARK 10
+++#endif
++ 	// Load VA of the trampoline
++ 	adrp	x0, arm_init_tramp@page
++ 	add		x0, x0, arm_init_tramp@pageoff
++@@ -954,6 +990,9 @@
++ 	bl		EXT(phystokv)
++ 
++ 	mov		lr, x19
+++#if SHENG
+++	SHENG_SMP_MARK 11
+++#endif
++ 
++ 	/* Return to arm_init() */
++ 	ret
++--- a/osfmk/arm/arm_init.c
+++++ b/osfmk/arm/arm_init.c
++@@ -862,7 +862,22 @@
++ 	__stack_chk_guard &= ~(0xFFULL << 8);
++ 	SHENG_LOG_STAGE("machine_startup enter");
++ 	machine_startup(args);
+++}
+++
+++#if SHENG
+++/* uke: secondary entry trace (osfmk/arm64/sheng_smp_entry.h), one 64-byte line per core by MPIDR Aff1. */
+++extern volatile uint64_t sheng_smp_entry[64];
+++static inline void
+++sheng_smp_entry_mark(uint64_t stage)
+++{
+++	uint64_t mpidr = __builtin_arm_rsr64("MPIDR_EL1");
+++	sheng_smp_entry[((mpidr >> 8) & 7) * 8] = stage;
+++	__asm__ volatile ("dsb sy" ::: "memory");
++ }
+++#define SHENG_SMP_ENTRY_MARK(stage) sheng_smp_entry_mark(stage)
+++#else
+++#define SHENG_SMP_ENTRY_MARK(stage) do { } while (0)
+++#endif
++ 
++ /*
++  * Routine:        arm_init_cpu
++@@ -878,6 +893,7 @@
++ #if __ARM_PAN_AVAILABLE__
++ 	__builtin_arm_wsr("pan", 1);
++ #endif
+++	SHENG_SMP_ENTRY_MARK(16);
++ 
++ #ifdef __arm64__
++ 	configure_timer_apple_regs();
++@@ -893,6 +909,7 @@
++ 
++ 
++ 	machine_set_current_thread(cpu_data_ptr->cpu_active_thread);
+++	SHENG_SMP_ENTRY_MARK(17);
++ 
++ #if APPLE_ARM64_ARCH_FAMILY
++ 	configure_late_apple_regs(false);
++@@ -929,8 +946,10 @@
++ #endif
++ 
++ 	cpu_machine_idle_init(FALSE);
+++	SHENG_SMP_ENTRY_MARK(18);
++ 
++ 	cpu_init();
+++	SHENG_SMP_ENTRY_MARK(19);
++ 
++ #ifdef  APPLETYPHOON
++ 	if ((cpus_defeatures & (0xF << 4 * cpu_data_ptr->cpu_number)) != 0) {
++@@ -941,6 +960,7 @@
++ 	 * drivers use mach_absolute_time() to implement rate control
++ 	 */
++ 	cpu_timebase_init(FALSE);
+++	SHENG_SMP_ENTRY_MARK(20);
++ 
++ #if KPERF
++ 	/* kptimer_curcpu_up() must be called after cpu_timebase_init */
++@@ -960,6 +980,7 @@
++ 		commpage_update_timebase();
++ 	}
++ 	PE_init_cpu();
+++	SHENG_SMP_ENTRY_MARK(21);
++ #if __arm64__
++ 	apt_msg_init_cpu();
++ #endif
++@@ -1008,6 +1029,7 @@
++ 	}
++ #endif
++ 
+++	SHENG_SMP_ENTRY_MARK(22);
++ 	secondary_cpu_main(NULL);
++ }
++ 
+diff --git a/platform/sheng/macos26/patches/0072-uke-smp-entry-faults.patch b/platform/sheng/macos26/patches/0072-uke-smp-entry-faults.patch
+new file mode 100644
+index 0000000..3c77136
+--- /dev/null
++++ b/platform/sheng/macos26/patches/0072-uke-smp-entry-faults.patch
+@@ -0,0 +1,42 @@
++--- a/osfmk/arm64/start.s
+++++ b/osfmk/arm64/start.s
++@@ -850,7 +850,10 @@
++ 	isb		sy
++ #if SHENG
++ 	SHENG_BOOTSTRAP_TRACE 13
+++	/* uke: a secondary keeps the V=P vectors until arm_init_tramp has run, so a fault on the way is recorded (sheng_smp_entry.h). */
+++	cbnz	x21, 7f
++ 	msr		VBAR_EL1, x28
+++7:
++ 	isb
++ 	SHENG_BOOTSTRAP_TRACE 14
++ #if SHENG
++@@ -942,6 +945,9 @@
++ 	add		x0, x0, arm_init_tramp@pageoff
++ 	add		x0, x0, x22
++ 	sub		x0, x0, x23
+++#if SHENG
+++	SHENG_SMP_RECORD_X0
+++#endif
++ 
++ 	// Branch to the trampoline
++ 	br		x0
++@@ -985,6 +991,9 @@
++ 
++ 
++ 	mov		x19, lr
+++#if SHENG
+++	SHENG_SMP_MARK 12
+++#endif
++ 	// Convert CPU data PA to VA and set as first argument
++ 	mov		x0, x21
++ 	bl		EXT(phystokv)
++@@ -992,6 +1001,8 @@
++ 	mov		lr, x19
++ #if SHENG
++ 	SHENG_SMP_MARK 11
+++	msr		VBAR_EL1, x28
+++	isb
++ #endif
++ 
++ 	/* Return to arm_init() */
+diff --git a/platform/sheng/macos26/patches/machine-cpu-uke-boot-ipi-late.patch b/platform/sheng/macos26/patches/machine-cpu-uke-boot-ipi-late.patch
+new file mode 100644
+index 0000000..8c890fe
+--- /dev/null
++++ b/platform/sheng/macos26/patches/machine-cpu-uke-boot-ipi-late.patch
+@@ -0,0 +1,51 @@
++--- a/ArmCpu/ArmCpu.cpp
+++++ b/ArmCpu/ArmCpu.cpp
++@@ -40,6 +40,9 @@
++ volatile uint32_t armcpu_gic_boot[8];
++ volatile uint32_t armcpu_core_timer[8], armcpu_core_sgi[8];   // per logical core: architectural timer interrupts and SGI 0 taken
++ static bool gSpiIpi = false;                // boot-arg armcpu-spi-ipi=1: IPIs are software-pended SPIs 1008+core routed to that core (ICC_SGI1R_EL1 generates nothing on this board)
+++static bool gSelfIpiBootLate = false;         // armcpu-self-ipi=2 (uke): the boot core takes its first IPI from the secondaries, not itself
+++class ArmCpu;
+++static ArmCpu *gBootArmCpu = nullptr;
++ static bool gSelfIpi = false;               // boot-arg armcpu-self-ipi=1: every core sends itself SGI 0 from initCPU
++ volatile uint32_t armcpu_irq_phase = 0,armcpu_irq_id = 1023;
++ volatile uint32_t armcpu_quiesce_calls = 0,armcpu_halt_calls = 0;
++@@ -368,7 +371,7 @@
++   unsigned skip = 0;
++   PE_parse_boot_argn ("armcpu-skip-gic", &skip, sizeof (skip));
++   skipGic = skip != 0;
++-  unsigned selfIpi = 0;
+++  unsigned selfIpi = 0;   // uke: any self-IPI mode (1 or 2) kept the secondaries at step 4 (logs F8, F9, F11, F13); opt in with armcpu-self-ipi
++   PE_parse_boot_argn ("armcpu-self-ipi", &selfIpi, sizeof (selfIpi));
++   unsigned spiIpi = 0;
++   PE_parse_boot_argn ("armcpu-spi-ipi", &spiIpi, sizeof (spiIpi));
++@@ -393,7 +396,8 @@
++     return true;
++   } else {
++     // Publish the shared IPI policy once, before releasing secondary registrations.
++-    gSelfIpi = selfIpi == 1;
+++    gSelfIpi = selfIpi == 1 || selfIpi == 2;
+++    gSelfIpiBootLate = selfIpi == 2;
++     gSpiIpi = spiIpi == 1;
++     uint64_t bootMpidr;
++     __asm__ volatile ("mrs %0, mpidr_el1" : "=r" (bootMpidr));
++@@ -523,6 +527,9 @@
++     // XNU clears SIGPdisabled for a core the first time that core takes an IPI, and cpu_signal() silently skips a core until then; Apple's
++     // CPU driver provokes it with a self-IPI from initCPU (osfmk/kern/machine.c, processor_up).
++     if (gSelfIpi) { signalCPU (this); }
+++    // uke: with the SPI route the boot core's own early IPI kept every secondary from entering the kernel (logs F8, F9), so in mode 2
+++    // each secondary that has come up sends the boot core one instead; the first one it takes enables IPIs to it.
+++    if (gSelfIpiBootLate && gBootArmCpu != nullptr) { signalCPU (gBootArmCpu); }
++     return;
++   }
++   if (!boot) { panic ("ArmCpu: secondary/resume CPU startup is unsupported"); }
++@@ -536,7 +543,8 @@
++   if (gSpiIpi) { spiIpiConfigure (gDist, logicalId, affinity); }
++   enableCPUTimeBase (true);
++   setCPUState (kIOCPUStateRunning);
++-  if (gSelfIpi) { signalCPU (this); }
+++  gBootArmCpu = this;
+++  if (gSelfIpi && !gSelfIpiBootLate) { signalCPU (this); }
++ }
++ 
++ void ArmCpu::dispatch (void *target, void *, void *, int)
+diff --git a/platform/sheng/macos26/patches/machine-cpu-uke-clean-ttep.patch b/platform/sheng/macos26/patches/machine-cpu-uke-clean-ttep.patch
+new file mode 100644
+index 0000000..e1d32e6
+--- /dev/null
++++ b/platform/sheng/macos26/patches/machine-cpu-uke-clean-ttep.patch
+@@ -0,0 +1,20 @@
++--- a/ArmCpu/ArmCpu.cpp
+++++ b/ArmCpu/ArmCpu.cpp
++@@ -13,6 +13,7 @@
++ // Kernel-internal entries used for secondary CPU startup (Darwin 23 osfmk).
++ extern "C" vm_offset_t ml_static_vtop (vm_offset_t);
++ extern "C" char LowResetVectorBase[], LowResetVectorEnd[], ResetHandlerData[], const_boot_args[];
+++extern "C" char cpu_ttep[];   // pmap_paddr_t: the kernel translation table root common_start loads into TTBR1
++ #if HAS_NATIVE_EL1_PAC
++ extern "C" char sheng_boot_pac_bank[];
++ extern "C" uint32_t sheng_boot_pac_ready;
++@@ -766,6 +767,9 @@
++   cleanToMemory (LowResetVectorBase, 0x10000);   // reset vector, start_cpu and the code up to the MMU enable
++   cleanToMemory (ResetHandlerData, 0x1000);
++   cleanToMemory (const_boot_args, 0x1000);
+++  // uke: common_start reads cpu_ttep with the MMU and caches off. Left dirty in the boot CPU's cache, the new core read a stale
+++  // root, and its first fetch at a kernel address (arm_init_tramp) took a synchronous external abort (logs F14-F18).
+++  cleanToMemory (cpu_ttep, sizeof (uint64_t));
++ #if HAS_NATIVE_EL1_PAC
++   if (__atomic_load_n (&sheng_boot_pac_ready, __ATOMIC_ACQUIRE) != 1) {
++     armcpu_smp_psci_rc[logicalId] = -1002;
+diff --git a/scripts/build_macos26_xnu.py b/scripts/build_macos26_xnu.py
+index 9d16f5e..ce9dfd7 100644
+--- a/scripts/build_macos26_xnu.py
++++ b/scripts/build_macos26_xnu.py
+@@ -94,12 +94,16 @@ PATCHES = [
+     ROOT / 'platform/sheng/macos26/patches/0068-uke-ui-page-trace.patch',
+     ROOT / 'platform/sheng/macos26/patches/0069-uke-unsealed-root.patch',
+     ROOT / 'platform/sheng/macos26/patches/0070-uke-critical-nopanic.patch',
++    ROOT / 'platform/sheng/macos26/patches/0071-uke-smp-entry-trace.patch',
++    ROOT / 'platform/sheng/macos26/patches/0072-uke-smp-entry-faults.patch',
+ ]
+ MACHINE_PATCH = ROOT / 'platform/sheng/macos26/patches/machine-driver-declarations.patch'
+ CPU_PATCH = ROOT / 'platform/sheng/macos26/patches/machine-cpu-registration.patch'
+ CPU_INTERRUPT_PATCH = ROOT / 'platform/sheng/macos26/patches/machine-cpu-interrupt-order.patch'
+ CPU_SMP_PATCH = ROOT / 'platform/sheng/macos26/patches/machine-cpu-smp-bootstrap.patch'
+ CPU_ASM_PATCH = ROOT / 'platform/sheng/macos26/patches/machine-cpu-inline-asm.patch'
++CPU_UKE_IPI_PATCH = ROOT / 'platform/sheng/macos26/patches/machine-cpu-uke-boot-ipi-late.patch'
++CPU_UKE_TTEP_PATCH = ROOT / 'platform/sheng/macos26/patches/machine-cpu-uke-clean-ttep.patch'
+ 
+ 
+ # Preserve diagnostics for exported Apple source/tool-generated code on Clang 27.
+@@ -291,7 +295,7 @@ def prepare() -> dict:
+     for name in language_headers:
+         stage_file(ROOT / 'platform/sheng/macos26/recovery' / name, source / ('osfmk/vm/sheng_' + name))
+     stage_file(language_generated, source / 'osfmk/vm/sheng_language_trace_pages.h')
+-    smp_headers = ('smp_keys.h', 'smp_keys_storage.h')
++    smp_headers = ('smp_keys.h', 'smp_keys_storage.h', 'smp_entry.h')
+     for name in smp_headers:
+         stage_file(ROOT / 'platform/sheng/macos26/pac' / name, source / ('osfmk/arm64/sheng_' + name))
+     subprocess.run(['git', '-C', source, 'add', '-N', 'osfmk/prng/sheng_crypto_image.h', 'pexpert/pexpert/arm64/SHENG.h',
+@@ -304,6 +308,7 @@ def prepare() -> dict:
+                     'osfmk/vm/sheng_language_trace.h', 'osfmk/vm/sheng_language_trace_kernel.h',
+                     'osfmk/vm/sheng_language_pages_kernel.h', 'osfmk/vm/sheng_language_trace_pages.h',
+                     'osfmk/arm64/sheng_smp_keys.h', 'osfmk/arm64/sheng_smp_keys_storage.h',
++                    'osfmk/arm64/sheng_smp_entry.h',
+                     'bsd/kern/sheng_process_output.h', 'pexpert/arm/pe_sheng_boot_progress.h',
+                     'pexpert/arm/pe_sheng_boot_progress_kernel.h', 'pexpert/arm/pe_sheng_panic_qr.h',
+                     'pexpert/arm/pe_sheng_framebuffer.h', 'pexpert/arm/pe_sheng_smp_log.h',
+@@ -524,6 +529,12 @@ def compile_sources(args, record: dict) -> None:
+     subprocess.run(['git', 'apply', '--directory=' + str(machine.relative_to(ROOT)),
+                     str(CPU_ASM_PATCH)], cwd=ROOT, check=True)
+     record['cpu_inline_asm_patch_sha256'] = sha(CPU_ASM_PATCH)
++    subprocess.run(['git', 'apply', '--directory=' + str(machine.relative_to(ROOT)),
++                    str(CPU_UKE_IPI_PATCH)], cwd=ROOT, check=True)
++    record['cpu_uke_boot_ipi_late_patch_sha256'] = sha(CPU_UKE_IPI_PATCH)
++    subprocess.run(['git', 'apply', '--directory=' + str(machine.relative_to(ROOT)),
++                    str(CPU_UKE_TTEP_PATCH)], cwd=ROOT, check=True)
++    record['cpu_uke_clean_ttep_patch_sha256'] = sha(CPU_UKE_TTEP_PATCH)
+     record['platform_objects'] = {}
+     for component in ('ArmDTPlatform', 'ArmCpu'):
+         original = ROOT / f'UniXNU/drivers/{component}/{component}.cpp'
+-- 
+2.54.0 (Apple Git-157)
+

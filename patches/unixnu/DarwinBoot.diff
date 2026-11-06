@@ -1,0 +1,372 @@
+diff --git a/DarwinBootPkg/Driver/DarwinBoot.c b/DarwinBootPkg/Driver/DarwinBoot.c
+index 25ce2d2..580ec12 100644
+--- a/DarwinBootPkg/Driver/DarwinBoot.c
++++ b/DarwinBootPkg/Driver/DarwinBoot.c
+@@ -18,7 +18,8 @@
+ #include "WindowSize.h"
+ 
+ #define WINDOW_SIZE  SIZE_256MB
+-#define BLOCK_SIZE   SIZE_2MB
++// 16K XNU boots with 32 MiB blocks; this also preserves 4K congruence.
++#define BLOCK_SIZE   SIZE_32MB
+ #define MAX_SEGMENTS 64
+ 
+ typedef struct {
+@@ -40,6 +41,8 @@ typedef struct {
+ STATIC EFI_HANDLE  mImage;
+ UINT64 EFIAPI DarwinCurrentEl (VOID);
+ VOID EFIAPI DarwinEnter (UINT64 Args, UINT64 Entry, UINT64 Memory, UINT64 Size, UINT64 VideoBase, UINT64 VideoBytes);
++VOID EFIAPI DarwinEnterEnd (VOID);
++UINT64 EFIAPI DarwinPhysicalAddress (UINT64 VirtualAddress);
+ 
+ #define READ_SYSREG(Name)  ({ UINT64 Value_; __asm__ volatile ("mrs %0, " #Name : "=r" (Value_)); Value_; })
+ 
+@@ -109,6 +112,8 @@ Done:
+   return Status;
+ }
+ 
++#include "NativeLogSave.h"
++
+ STATIC
+ EFI_STATUS
+ ParseKernel (CONST UINT8 *Data, UINTN Size, KERNEL *Kernel)
+@@ -125,9 +130,17 @@ ParseKernel (CONST UINT8 *Data, UINTN Size, KERNEL *Kernel)
+   BOOLEAN  Executable;
+ 
+   if ((Size < 32) || (U32 (Data) != 0xfeedfacf) || (U32 (Data + 4) != 0x100000c) ||
+-      (U32 (Data + 8) != 0) || (U32 (Data + 12) != 2)) {
++      ((U32 (Data + 8) != 0) && ((U32 (Data + 8) & 0xff) != 2)) || (U32 (Data + 12) != 2)) {
+     return EFI_UNSUPPORTED;
+   }
++  if ((U32 (Data + 8) & 0xff) == 2) {
++    UINT64 Isar1 = READ_SYSREG (id_aa64isar1_el1);
++    // Both address and generic authentication are used by the native kernel.
++    if (((Isar1 & 0xff0) == 0) || ((Isar1 & 0xff000000) == 0)) {
++      Print (L"DARWINBOOT: ARM64E refused - architectural PAC unavailable\n");
++      return EFI_UNSUPPORTED;
++    }
++  }
+   if (U32 (Data + 20) > Size - 32) { return EFI_LOAD_ERROR; }
+   ZeroMem (Kernel, sizeof (*Kernel));
+   Count = U32 (Data + 16);
+@@ -183,7 +196,7 @@ ParseKernel (CONST UINT8 *Data, UINTN Size, KERNEL *Kernel)
+ 
+ STATIC
+ BOOLEAN
+-AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN ParentPath, UINTN *RamdiskOffset, UINTN *TrustCacheOffset, UINTN *AddonOffset, UINT64 *WindowSize, BOOLEAN *KeepPacked)
++AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN ParentPath, UINTN *RamdiskOffset, UINTN *TrustCacheOffset, UINTN *AddonOffset, UINTN *PanicOffset, UINT64 *WindowSize, BOOLEAN *KeepPacked)
+ {
+   UINT32 Properties;
+   UINT32 Children;
+@@ -194,6 +207,7 @@ AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN Parent
+   UINTN  TrustCandidate;
+   UINTN  AddonCandidate;
+   UINTN  MemoryCandidate;
++  UINTN  RegCandidate;
+   CONST UINT8 *Name;
+   UINTN  NameLength;
+ 
+@@ -203,6 +217,7 @@ AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN Parent
+   TrustCandidate = MAX_UINTN;
+   AddonCandidate = MAX_UINTN;
+   MemoryCandidate = MAX_UINTN;
++  RegCandidate = MAX_UINTN;
+   if ((Depth > 64) || (Size - *Offset < 8)) { return FALSE; }
+   Properties = U32 (Data + *Offset);
+   Children = U32 (Data + *Offset + 4);
+@@ -236,6 +251,10 @@ AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN Parent
+       if ((AddonCandidate != MAX_UINTN) || (Length != 16)) { return FALSE; }
+       AddonCandidate = *Offset;
+     }
++    if ((Length == 16) && (AsciiStrCmp ((CONST CHAR8 *)(Data + *Offset - 36), "reg") == 0)) {
++      if (RegCandidate != MAX_UINTN) { return FALSE; }
++      RegCandidate = *Offset;
++    }
+     if (AsciiStrCmp ((CONST CHAR8 *)(Data + *Offset - 36), "darwinboot-memory-size") == 0) {
+       if ((MemoryCandidate != MAX_UINTN) || (Length != 8)) { return FALSE; }
+       MemoryCandidate = *Offset;
+@@ -248,6 +267,11 @@ AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN Parent
+   if (Depth == 0) { Path = 0; }
+   if ((Depth == 1) && (ParentPath == 0) && (NameLength == 7) && (CompareMem (Name, "chosen", 7) == 0)) { Path = 1; }
+   if ((Depth == 2) && (ParentPath == 1) && (NameLength == 11) && (CompareMem (Name, "memory-map", 11) == 0)) { Path = 2; }
++  if ((Depth == 1) && (ParentPath == 0) && (NameLength == 5) && (CompareMem (Name, "pram", 5) == 0)) {
++    if ((*PanicOffset != MAX_UINTN) || (RegCandidate == MAX_UINTN) ||
++        (U64 (Data + RegCandidate) != 0) || (U64 (Data + RegCandidate + 8) != 0)) { return FALSE; }
++    *PanicOffset = RegCandidate;
++  }
+   if ((Path == 2) && (Candidate != MAX_UINTN)) {
+     if (*RamdiskOffset != MAX_UINTN) { return FALSE; }
+     *RamdiskOffset = Candidate;
+@@ -267,7 +291,7 @@ AdtNode (CONST UINT8 *Data, UINTN Size, UINTN *Offset, UINTN Depth, UINTN Parent
+   }
+   if (Children > (Size - *Offset) / 8) { return FALSE; }
+   for (Index = 0; Index < Children; Index++) {
+-    if (!AdtNode (Data, Size, Offset, Depth + 1, Path, RamdiskOffset, TrustCacheOffset, AddonOffset, WindowSize, KeepPacked)) { return FALSE; }
++    if (!AdtNode (Data, Size, Offset, Depth + 1, Path, RamdiskOffset, TrustCacheOffset, AddonOffset, PanicOffset, WindowSize, KeepPacked)) { return FALSE; }
+   }
+   return TRUE;
+ }
+@@ -491,6 +515,8 @@ Boot (
+   UINT64                          TrustCacheAddress;
+   UINTN                           AddonOffset;
+   UINT64                          AddonAddress;
++  UINTN                           PanicOffset;
++  UINT64                          PanicAddress;
+   DARWIN_BOOT_ARGS                *Args;
+   EFI_MEMORY_DESCRIPTOR           *Map;
+   UINTN                           Capacity;
+@@ -501,6 +527,8 @@ Boot (
+   UINTN                           Attempt;
+   CHAR8                           CommandLine[1024];
+   UINT64                          Video[6];
++  EFI_STATUS                      LogRecoveryStatus;
++  EFI_STATUS                      LogArmStatus;
+ 
+   (VOID)This;
+   if ((Request == NULL) || (Request->Volume == NULL) || (Request->KernelPath == NULL)) { return EFI_INVALID_PARAMETER; }
+@@ -537,6 +565,12 @@ Boot (
+   if (EFI_ERROR (Status)) { return Status; }
+   Status = Fs->OpenVolume (Fs, &Root);
+   if (EFI_ERROR (Status)) { return Status; }
++  // Snapshot the prior run before kernel file loading or window allocation can reuse its pages.
++  Status = NativeLogSave ();
++  LogRecoveryStatus = Status;
++  if (EFI_ERROR (Status) && (Status != EFI_NOT_FOUND)) {
++    Print (L"DARWINBOOT: RAM log recovery skipped: %r\n", Status);
++  }
+   Status = ReadFile (Root, Request->KernelPath, SIZE_128MB, &Image, &ImageSize);
+   if (EFI_ERROR (Status)) { goto Fail; }
+   Status = ParseKernel (Image, ImageSize, &Kernel);
+@@ -552,9 +586,10 @@ Boot (
+   RamdiskOffset = MAX_UINTN;
+   TrustCacheOffset = MAX_UINTN;
+   AddonOffset = MAX_UINTN;
++  PanicOffset = MAX_UINTN;
+   WindowSize = 0;
+   KeepPacked = FALSE;
+-  if (!AdtNode (Tree, TreeSize, &Offset, 0, 3, &RamdiskOffset, &TrustCacheOffset, &AddonOffset, &WindowSize, &KeepPacked) || (Offset != TreeSize)) { Status = EFI_COMPROMISED_DATA; goto Fail; }
++  if (!AdtNode (Tree, TreeSize, &Offset, 0, 3, &RamdiskOffset, &TrustCacheOffset, &AddonOffset, &PanicOffset, &WindowSize, &KeepPacked) || (Offset != TreeSize)) { Status = EFI_COMPROMISED_DATA; goto Fail; }
+   if (KeepPacked && (!RamdiskPacked || (RamdiskOffset == MAX_UINTN))) { Status = EFI_COMPROMISED_DATA; goto Fail; }
+   if (WindowSize == 0) { WindowSize = WINDOW_SIZE; }
+   if (Kernel.Base > MAX_UINT64 - WindowSize) { Status = EFI_LOAD_ERROR; goto Fail; }
+@@ -607,7 +642,8 @@ Boot (
+   RamdiskBytes = ALIGN_VALUE (KeepPacked ? Request->RamdiskSize : RamdiskExpandedSize, EFI_PAGE_SIZE);
+   TrustCacheAddress = RamdiskAddress + RamdiskBytes;
+   AddonAddress = ALIGN_VALUE (TrustCacheAddress + TrustCacheSize, SIZE_16KB);
+-  Used = ALIGN_VALUE (AddonAddress + AddonSize, SIZE_16KB) - Address;
++  PanicAddress = ALIGN_VALUE (AddonAddress + AddonSize, SIZE_16KB);
++  Used = PanicAddress + ((PanicOffset != MAX_UINTN) ? SIZE_512KB : 0) - Address;
+   if (Used > WindowSize - BLOCK_SIZE) {
+     Print (L"DARWINBOOT: used %lu window %lu kernel %lu ramdisk %lu\n", (UINT64)Used, (UINT64)WindowSize, (UINT64)(Kernel.End - Kernel.Base), (UINT64)RamdiskBytes);
+     Status = EFI_BAD_BUFFER_SIZE;
+@@ -631,6 +667,11 @@ Boot (
+   Args->DeviceTreeLength = (UINT32)TreeSize;
+   CopyMem (Args->CommandLine, CommandLine, sizeof (CommandLine));
+   CopyMem ((VOID *)(UINTN)TreeAddress, Tree, TreeSize);
++  if (PanicOffset != MAX_UINTN) {
++    WriteUnaligned64 ((UINT64 *)(UINTN)(TreeAddress + PanicOffset), PanicAddress);
++    WriteUnaligned64 ((UINT64 *)(UINTN)(TreeAddress + PanicOffset + 8), SIZE_512KB);
++    Print (L"DARWINBOOT: panic RAM PA=0x%lx size=0x%lx\n", PanicAddress, (UINT64)SIZE_512KB);
++  }
+   if (Request->Ramdisk != NULL) {
+     if (KeepPacked) { CopyMem ((VOID *)(UINTN)RamdiskAddress, Request->Ramdisk, Request->RamdiskSize); }
+     else { CopyRamdisk ((VOID *)(UINTN)RamdiskAddress, Request->Ramdisk, Request->RamdiskSize, RamdiskPacked); }
+@@ -649,6 +690,11 @@ Boot (
+     WriteUnaligned64 ((UINT64 *)(UINTN)(TreeAddress + AddonOffset + 8), AddonSize);
+     FreePool (Addon); Addon = NULL;
+   }
++  Status = NativeLogArm (Image, ImageSize, &Kernel, Address, PanicAddress, PanicOffset != MAX_UINTN);
++  LogArmStatus = Status;
++  if (EFI_ERROR (Status) && (Status != EFI_NOT_FOUND) && (Status != EFI_UNSUPPORTED)) {
++    Print (L"DARWINBOOT: next RAM capture not armed: %r\n", Status);
++  }
+   FreePool (Image); Image = NULL;
+   FreePool (Tree); Tree = NULL;
+   FreePool (TreePath); TreePath = NULL;
+@@ -659,6 +705,37 @@ Boot (
+          Kernel.Base, Address, ArgsAddress, Address + Kernel.Entry - Kernel.Base, (UINT64)WindowSize);
+   Print (L"DARWINBOOT: video base=0x%lx display=%lu row=%lu width=%lu height=%lu depth=%lu\n",
+          Video[0], Video[1], Video[2], Video[3], Video[4], Video[5]);
++  // The handoff executes from its current address with translation disabled.
++  // Reject a relocated mapping before ExitBootServices instead of losing the PC.
++  {
++    UINT64 HandoffStart = (UINT64)(UINTN)DarwinEnter;
++    UINT64 HandoffEnd = (UINT64)(UINTN)DarwinEnterEnd;
++    UINT64 Cursor;
++    if ((HandoffEnd <= HandoffStart) || (HandoffEnd - HandoffStart > SIZE_4KB)) {
++      Status = EFI_LOAD_ERROR;
++      goto Fail;
++    }
++    Print (L"DARWINBOOT: handoff va 0x%lx pa 0x%lx end 0x%lx\n",
++           HandoffStart, DarwinPhysicalAddress (HandoffStart), HandoffEnd);
++    for (Cursor = HandoffStart & ~(UINT64)(EFI_PAGE_SIZE - 1);
++         Cursor < HandoffEnd; Cursor += EFI_PAGE_SIZE) {
++      if (DarwinPhysicalAddress (Cursor) != Cursor) {
++        Print (L"DARWINBOOT: handoff identity mapping refused at 0x%lx\n", Cursor);
++        Status = EFI_UNSUPPORTED;
++        goto Fail;
++      }
++    }
++    if ((DarwinPhysicalAddress (Address + Kernel.Entry - Kernel.Base) != Address + Kernel.Entry - Kernel.Base) ||
++        (DarwinPhysicalAddress (ArgsAddress) != ArgsAddress) ||
++        ((Video[0] != 0) &&
++         ((DarwinPhysicalAddress (Video[0]) != Video[0]) ||
++          (DarwinPhysicalAddress (Video[0] + ((Video[2] * Video[4]) >> 6) * 3 - 1) !=
++           Video[0] + ((Video[2] * Video[4]) >> 6) * 3 - 1)))) {
++      Print (L"DARWINBOOT: kernel, args or framebuffer identity mapping refused\n");
++      Status = EFI_UNSUPPORTED;
++      goto Fail;
++    }
++  }
+   Print (L"DARWINBOOT: inputs validated; exiting boot services\n");
+ 
+   //
+@@ -670,6 +747,9 @@ Boot (
+   DEBUG ((DEBUG_ERROR, "kernel   va 0x%lx  pa 0x%lx\n", Kernel.Base, Address));
+   DEBUG ((DEBUG_ERROR, "entry    pa 0x%lx\n", Address + Kernel.Entry - Kernel.Base));
+   DEBUG ((DEBUG_ERROR, "args     pa 0x%lx  window 0x%lx bytes\n", ArgsAddress, (UINT64)WindowSize));
++  if (PanicOffset != MAX_UINTN) {
++    DEBUG ((DEBUG_ERROR, "panic    pa 0x%lx  bytes 0x%lx\n", PanicAddress, (UINT64)SIZE_512KB));
++  }
+   DEBUG ((DEBUG_ERROR, "video    base 0x%lx  %lux%lu  row %lu bytes  %lu bpp\n", Video[0], Video[3], Video[4], Video[2], Video[5]));
+   DEBUG ((DEBUG_ERROR, "entry words %08x %08x %08x %08x\n",
+           ReadUnaligned32 ((CONST UINT32 *)(UINTN)(Address + Kernel.Entry - Kernel.Base)),
+@@ -680,7 +760,15 @@ Boot (
+   DEBUG ((DEBUG_ERROR, "ID_AA64MMFR0_EL1 0x%lx  (PARange %lu, 4 KiB granule %a)\n", READ_SYSREG (id_aa64mmfr0_el1),
+           READ_SYSREG (id_aa64mmfr0_el1) & 0xF, (((READ_SYSREG (id_aa64mmfr0_el1) >> 28) & 0xF) == 0xF) ? "NOT supported" : "supported"));
+   DEBUG ((DEBUG_ERROR, "ID_AA64PFR0_EL1  0x%lx\n", READ_SYSREG (id_aa64pfr0_el1)));
+-  DEBUG ((DEBUG_ERROR, "\nExiting boot services. A green bar across the top\nmeans the kernel entry code ran.\n"));
++  DEBUG ((DEBUG_ERROR, "\nExiting boot services. A green bar across the top\nmeans the loader handoff code ran.\n"));
++  // Capture the actual load and panic addresses before the kernel owns video.
++  if (AsciiStrStr (CommandLine, "-sheng-capture-handoff") != NULL) {
++    Print (L"DARWINBOOT: kernel pa 0x%lx panic pa 0x%lx\n", Address, PanicAddress);
++    Print (L"HANDOFF: green=entered blue=cache-clean orange=MMU-off\n");
++    Print (L"MACOSLOG: recovery=%r next=%r\n", LogRecoveryStatus, LogArmStatus);
++    Print (L"DARWINBOOT: capture handoff addresses - starting in 10 seconds\n");
++    gBS->Stall (10000000);
++  }
+   for (Attempt = 0; Attempt < 3; Attempt++) {
+     MapSize = Capacity;
+     Status = gBS->GetMemoryMap (&MapSize, Map, &Key, &Stride, &Version);
+diff --git a/DarwinBootPkg/Driver/DarwinBoot.inf b/DarwinBootPkg/Driver/DarwinBoot.inf
+index 3a90c96..17d08bb 100644
+--- a/DarwinBootPkg/Driver/DarwinBoot.inf
++++ b/DarwinBootPkg/Driver/DarwinBoot.inf
+@@ -13,6 +13,7 @@
+   BootArgs.h
+   BootVideo.h
+   DiagFont.h
++  NativeLogSave.h
+   Entry.S
+ 
+ [Packages]
+@@ -34,6 +35,8 @@
+   gEfiSimpleFileSystemProtocolGuid ## CONSUMES
+   gEfiLoadedImageProtocolGuid ## CONSUMES
+   gEfiGraphicsOutputProtocolGuid ## CONSUMES
++  gEfiPartitionInfoProtocolGuid ## CONSUMES
++  gEfiBlockIoProtocolGuid ## CONSUMES
+ 
+ [Guids]
+   gEfiFileInfoGuid
+diff --git a/DarwinBootPkg/Driver/Entry.S b/DarwinBootPkg/Driver/Entry.S
+index 890d4df..96b9f61 100644
+--- a/DarwinBootPkg/Driver/Entry.S
++++ b/DarwinBootPkg/Driver/Entry.S
+@@ -1,6 +1,25 @@
+ // SPDX-License-Identifier: BSD-2-Clause-Patent
+ #include <AsmMacroLib.h>
+ 
++// Three strips retain the actual transition reached without calling firmware.
++.macro DARWIN_HANDOFF_PROGRESS lo, hi, stage
++  cbz x12, 9f
++  lsr x9, x13, #6
++  bic x9, x9, #7
++  cbz x9, 9f
++  mov x14, #\stage
++  madd x11, x9, x14, x12
++  mov w10, #\lo
++  movk w10, #\hi, lsl #16
++8:
++  stp w10, w10, [x11], #8
++  subs x9, x9, #8
++  b.hi 8b
++  dsb sy
++9:
++.endm
++
++
+ ASM_FUNC(DarwinCurrentEl)
+   mrs x0, CurrentEL
+   ret
+@@ -9,26 +28,26 @@ ASM_FUNC(DarwinCurrentEl)
+ // PA (0 for none), x5=its size in bytes. EL1 only.
+ ASM_FUNC(DarwinEnter)
+   msr daifset, #15
+-  // Breadcrumb: a green bar (BGRA 0xFF00FF00) over the top 1/16 of the frame
+-  // buffer shows that this code ran, whatever the kernel does afterwards.
+-  cbz x4, 2f
+-  lsr x9, x5, #4
+-  bic x9, x9, #7
+-  mov w10, #0xFF00
+-  movk w10, #0xFF00, lsl #16
+-  mov x11, x4
+-3:
+-  stp w10, w10, [x11], #8
+-  subs x9, x9, #8
+-  b.hi 3b
+-  dsb sy
+-2:
++  mov x12, x4
++  mov x13, x5
++  DARWIN_HANDOFF_PROGRESS 0xFF00, 0xFF00, 0
+   add x5, x2, x3
+   mrs x6, ctr_el0
+   ubfx x6, x6, #16, #4
+   mov x7, #4
+   lsl x6, x7, x6
+   sub x7, x6, #1
++  // The executing handoff is outside the owned kernel window.
++  adr x4, DarwinEnter
++  bic x4, x4, x7
++  adr x8, DarwinEnterEnd
++  dsb sy
++5:
++  dc cvac, x4
++  add x4, x4, x6
++  cmp x4, x8
++  b.lo 5b
++  dsb sy
+   bic x4, x2, x7
+   dsb sy
+ 1:
+@@ -40,6 +59,7 @@ ASM_FUNC(DarwinEnter)
+   ic iallu
+   dsb sy
+   isb
++  DARWIN_HANDOFF_PROGRESS 0x00FF, 0xFF00, 1
+   mrs x4, sctlr_el1
+   bic x4, x4, #1
+   bic x4, x4, #4
+@@ -49,4 +69,21 @@ ASM_FUNC(DarwinEnter)
+   tlbi vmalle1
+   dsb sy
+   isb
++  DARWIN_HANDOFF_PROGRESS 0x8800, 0xFFFF, 2
+   br x1
++
++ASM_FUNC(DarwinEnterEnd)
++
++// Translate under the actual firmware tables without dereferencing the VA.
++ASM_FUNC(DarwinPhysicalAddress)
++  at s1e1r, x0
++  isb
++  mrs x1, par_el1
++  tbnz x1, #0, 1f
++  and x1, x1, #0x0000fffffffff000
++  and x0, x0, #0xfff
++  orr x0, x1, x0
++  ret
++1:
++  mov x0, #-1
++  ret

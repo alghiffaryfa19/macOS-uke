@@ -1,0 +1,75 @@
+--- a/osfmk/kern/bsd_kern.c
++++ b/osfmk/kern/bsd_kern.c
+@@ -1544,7 +1544,7 @@
+ static void
+ uke_sample_task(task_t task)
+ {
+-	thread_t threads[UKE_SAMPLE_THREADS];
++	thread_t sampled[UKE_SAMPLE_THREADS];
+ 	unsigned count = 0;
+ 	thread_t member;
+ 	task_lock(task);
+@@ -1553,37 +1553,37 @@
+ 			break;
+ 		}
+ 		thread_reference(member);
+-		threads[count++] = member;
++		sampled[count++] = member;
+ 	}
+-	uint64_t image = task->mach_header_vm_address;
+-	vm_map_t map = task->map;
+-	vm_map_reference(map);
++	uint64_t image_base = task->mach_header_vm_address;
++	vm_map_t task_map = task->map;
++	vm_map_reference(task_map);
+ 	task_unlock(task);
+ 
+-	uint64_t slide = 0;
+-	vm_shared_region_t sr = vm_shared_region_get(task);
+-	if (sr) {
++	uint64_t cache_slide = 0;
++	vm_shared_region_t region = vm_shared_region_get(task);
++	if (region) {
+ 		mach_vm_offset_t start = 0;
+-		if (vm_shared_region_start_address(sr, &start) == KERN_SUCCESS && start >= SHARED_REGION_BASE_ARM64) {
+-			slide = start - SHARED_REGION_BASE_ARM64;
++		if (vm_shared_region_start_address(region, &start) == KERN_SUCCESS && start >= SHARED_REGION_BASE_ARM64) {
++			cache_slide = start - SHARED_REGION_BASE_ARM64;
+ 		}
+-		vm_shared_region_deallocate(sr);
++		vm_shared_region_deallocate(region);
+ 	}
+ 	printf("UKE-SAMPLE: pid %d round %u image 0x%llx cache slide 0x%llx threads %u\n", uke_sample_pid, uke_sample_rounds,
+-	    image, slide, count);
++	    image_base, cache_slide, count);
+ 	for (unsigned i = 0; i < count; i++) {
+-		struct arm_saved_state *ss = get_user_regs(threads[i]);
++		struct arm_saved_state *ss = get_user_regs(sampled[i]);
+ 		if (!ss || !is_saved_state64(ss)) {
+ 			continue;
+ 		}
+ 		uint64_t fp = get_saved_state_fp(ss);
+-		printf("UKE-SAMPLE: t%u tid %llu state 0x%x pc 0x%llx lr 0x%llx\n", i, thread_tid(threads[i]), threads[i]->state,
++		printf("UKE-SAMPLE: t%u tid %llu state 0x%x pc 0x%llx lr 0x%llx\n", i, thread_tid(sampled[i]), sampled[i]->state,
+ 		    get_saved_state_pc(ss) & UKE_SAMPLE_MASK, get_saved_state_lr(ss) & UKE_SAMPLE_MASK);
+ 		uint64_t frames[UKE_SAMPLE_FRAMES];
+ 		unsigned depth = 0;
+ 		while (depth < UKE_SAMPLE_FRAMES && fp && !(fp & 7)) {
+ 			uint64_t frame[2];
+-			if (vm_map_read_user(map, (vm_map_address_t)fp, frame, sizeof(frame)) != KERN_SUCCESS) {
++			if (vm_map_read_user(task_map, (vm_map_address_t)fp, frame, sizeof(frame)) != KERN_SUCCESS) {
+ 				break;
+ 			}
+ 			frames[depth++] = frame[1] & UKE_SAMPLE_MASK;
+@@ -1598,9 +1598,9 @@
+ 		}
+ 	}
+ 	for (unsigned i = 0; i < count; i++) {
+-		thread_deallocate(threads[i]);
++		thread_deallocate(sampled[i]);
+ 	}
+-	vm_map_deallocate(map);
++	vm_map_deallocate(task_map);
+ }
+ 
+ static void

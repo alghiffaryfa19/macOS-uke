@@ -1,0 +1,48 @@
+--- a/NativeGOPDisplay.cpp
++++ b/NativeGOPDisplay.cpp
+@@ -173,6 +173,27 @@
+     return scale;
+ }
+ 
++// uke: with several cores the kernel console takes the framebuffer writer lease for microseconds all the time. Retry the
++// lease instead of abandoning the whole frame on the first collision; stop only if the owner really changed (panic).
++static bool ukeFbBegin(unsigned owner, uint64_t *saved)
++{
++    for (unsigned attempt = 0; attempt < 100000; attempt++) {
++        if (sheng_fb_begin(owner, saved)) return true;
++        if (__atomic_load_n(&sheng_framebuffer.owner, __ATOMIC_ACQUIRE) != owner) return false;
++        __asm__ volatile("yield");
++    }
++    return false;
++}
++static bool ukeFbClaimGui(void)
++{
++    for (unsigned attempt = 0; attempt < 100000; attempt++) {
++        if (sheng_fb_claim_gui()) return true;
++        if (__atomic_load_n(&sheng_framebuffer.owner, __ATOMIC_ACQUIRE) != SHENG_FB_BOOT) return false;
++        __asm__ volatile("yield");
++    }
++    return false;
++}
++
+ bool NativeGOPDisplay::start(IOService *provider)
+ {
+     unsigned enabled = 0, cpus = 0;
+@@ -443,7 +464,7 @@
+         bool active = false, committed = false;
+         uint64_t ready = 0, status = 0;
+         explicit DiagnosticHandoff(bool first) {
+-            if (!first || !sheng_fb_claim_gui()) return;
++            if (!first || !ukeFbClaimGui()) return;
+             active = true;
+             ready = sheng_panel_ready; status = sheng_status_pixels;
+             sheng_panel_ready = 0; sheng_status_pixels = 0;
+@@ -471,7 +492,7 @@
+             return;
+         }
+         uint64_t saved;
+-        if (!sheng_fb_begin(SHENG_FB_GUI, &saved)) return;
++        if (!ukeFbBegin(SHENG_FB_GUI, &saved)) return;
+         auto *pixels = reinterpret_cast<volatile uint32_t *>(line);
+         nativeGopScanoutRow(pixels, copyWidth, fRow, width,
+                            format == kFormatRGhA ? fHalfToByte : nullptr);

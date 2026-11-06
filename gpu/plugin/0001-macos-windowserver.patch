@@ -1,0 +1,185 @@
+diff --git a/NativeAdrenoMetalPlugin.mm b/NativeAdrenoMetalPlugin.mm
+index 415e9c8..2459c4b 100644
+--- a/NativeAdrenoMetalPlugin.mm
++++ b/NativeAdrenoMetalPlugin.mm
+@@ -8,6 +8,7 @@
+ // gets its own native device too (its own driver connection, GPU address space and shader cache), as every process does with Apple's
+ // own GPU plugin.
+ #import <Foundation/Foundation.h>
++#include "UkeRenderServer.h"
+ #include "SharedShaderCache.h"
+ #include <pthread.h>
+ #include <thread>
+@@ -185,7 +186,7 @@ static id clientDevice(unsigned port) {
+     }
+     if (!device && !usable) {
+         setenv("METAL2VULKAN_SHADER_CACHE_OPTIONAL", "1", 1);
+-        const char *path = candidates[0][0] ? candidates[0] : candidates[1][0] ? candidates[1] : "/var/mobile/tmp/m2v";
++        const char *path = candidates[0][0] ? candidates[0] : candidates[1][0] ? candidates[1] : UKE_FALLBACK_CACHE;
+         @try {
+             device = native_bridge_metal_open(turnip, path, registryID, nullptr);
+         } @catch (NSException *exception) {
+@@ -241,6 +242,8 @@ static id deviceForPort(unsigned port) {
+         setenv("TU_DEBUG", bootArgSet("sheng-fb-bgra=1") ? "sysmem,nocb" : "nocb", 0);
+         // sheng-diag=1 turns on every diagnostic of the GPU stack in this process: the frontend's frame trace, Turnip's pass stamps and
+         // submission ring, the runtime's stage ring, and in the render server the status and telemetry lines. Without it none of them runs.
++        // Turnip opens the accelerator by class name (tu_knl_darwin.cc defaults to iPadOS's IOAcceleratorES).
++        setenv("TU_DARWIN_SERVICE", UKE_ACCELERATOR_CLASS, 0);
+         if (bootArgSet("sheng-diag=1") || bootArgSet("sheng-gpu-trace=1")) setenv("SHENG_DIAG", "1", 1);
+         else unsetenv("SHENG_DIAG");
+         if (bootArgSet("sheng-gpu-trace=1")) setenv("SHENG_GPU_TRACE", "1", 1);
+@@ -249,7 +252,7 @@ static id deviceForPort(unsigned port) {
+         // log-gpu=1: the GPU stack's log lines (NSLog, the pipeline journal); off without it.
+         if (bootArgSet("log-gpu=1")) setenv("SHENG_LOG_GPU", "1", 1);
+         else unsetenv("SHENG_LOG_GPU");
+-        if (strcmp(getprogname(), "backboardd") != 0) return device = clientDevice(port);
++        if (strcmp(getprogname(), UKE_RENDER_SERVER) != 0) return device = clientDevice(port);
+         // The discovery releases the accelerator port when it is done; the monitor and the scanout client keep using it.
+         if (void *iokit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW | RTLD_LOCAL)) {
+             if (auto retain = (int (*)(unsigned))dlsym(iokit, "IOObjectRetain")) retain(port);
+@@ -290,7 +293,7 @@ static id deviceForPort(unsigned port) {
+         }
+         // The render server compresses its framebuffer (an Apple/AGX layout this GPU does not write) unless told not to; the display driver takes plain rows.
+         setenv("CA_DISABLE_FRAMEBUFFER_COMPRESSION", "1", 1);
+-#if defined(__arm64e__)
++#if defined(__arm64e__) && !TARGET_OS_OSX
+         // iPadOS 27 picks a 64-bit half-float framebuffer ('RGhA') whenever the display's EDR headroom is above 1 (this panel reports XDR
+         // headroom), which the display path can only show converted, slowly and greyed. As on iPadOS 17, where the render server drew plain
+         // 8-bit BGRA, the headroom is held at 1. IOMFBDisplay::framebuffer_pixel_format (24A446 0x184461838, asked on every update) takes
+@@ -314,7 +317,7 @@ static id deviceForPort(unsigned port) {
+             gpu->mark(writeTask(0x1e7021104 + slide, &never, sizeof never) ? 0x6E02 : 0x6EF2);
+             const uint8_t off = 0;
+             gpu->mark(writeTask(0x1e702116c + 156 + slide, &off, sizeof off) ? 0x6E03 : 0x6EF3);
+-            if (!strcmp(getprogname(), "backboardd") && bootArgSet("sheng-fb-bgra=1")) gpu->mark(patchFramebufferBranch(slide));
++            if (!strcmp(getprogname(), UKE_RENDER_SERVER) && bootArgSet("sheng-fb-bgra=1")) gpu->mark(patchFramebufferBranch(slide));
+             // What framebuffer_pixel_format reads in the render server, once the desktop has started (other processes draw no
+             // framebuffer): 0x6E20 | 1 headroom override 1, 2 threshold above 1, 4 CA_FORCE_FP16_FRAMEBUFFER (_ca_debug_options
+             // 0x1e702116c + 128), 8 CA_ALLOW_EDR_MIRRORING (+ 156), 0x10 the device-is-virtualized byte (0x1e701bdd9).
+@@ -325,7 +328,7 @@ static id deviceForPort(unsigned port) {
+             static uintptr_t gSlide;
+             gSlide = slide;
+             pthread_t reader;
+-            if (!strcmp(getprogname(), "backboardd") && pthread_create(&reader, nullptr, [](void *arg) -> void * {
++            if (!strcmp(getprogname(), UKE_RENDER_SERVER) && pthread_create(&reader, nullptr, [](void *arg) -> void * {
+                 sleep(30);
+                 const float headroom = *reinterpret_cast<volatile const float *>(0x1e7021014 + gSlide);
+                 const float threshold = *reinterpret_cast<volatile const float *>(0x1e7021104 + gSlide);
+@@ -362,7 +365,7 @@ static id deviceForPort(unsigned port) {
+         // so with a persistent Data store the pipelines were still compiled again each boot (V row hit0). Try the user's Library/Caches first
+         // (marker 0x6814); the earlier candidates keep their markers.
+         if (const passwd *user = getpwuid(getuid()); user && user->pw_dir && user->pw_dir[0]) {
+-            snprintf(candidates[4], sizeof candidates[4] - 16, "%s/Library/Caches/com.apple.backboardd", user->pw_dir);
++            snprintf(candidates[4], sizeof candidates[4] - 16, "%s/Library/Caches/" UKE_RENDER_CACHE_LEAF, user->pw_dir);
+             mkdir(candidates[4], 0700);
+             strlcat(candidates[4], "/", sizeof candidates[4]);
+         }
+@@ -441,7 +444,7 @@ static id deviceForPort(unsigned port) {
+         pthread_attr_destroy(&attributes);
+         // The GMEM colour order test (NativeTurnipSwapTest.h), once, 20 s after the device is published: each result line goes to the
+         // kernel's GPU trace as a problem record (event 65).
+-        if (bootArgSet("sheng-swaptest=1") && !strcmp(getprogname(), "backboardd")) {
++        if (bootArgSet("sheng-swaptest=1") && !strcmp(getprogname(), UKE_RENDER_SERVER)) {
+             pthread_t tester;
+             pthread_create(&tester, nullptr, [](void *) -> void * {
+                     sleep(20);
+@@ -497,7 +500,7 @@ - (id)initWithAcceleratorPort:(unsigned)port {
+                 auto matching = (void *(*)(const char *))dlsym(iokit, "IOServiceMatching");
+                 auto getService = (unsigned (*)(unsigned, void *))dlsym(iokit, "IOServiceGetMatchingService");
+                 if (matching && getService) {
+-                    const unsigned own = getService(0, matching("IOAcceleratorES"));
++                    const unsigned own = getService(0, matching(UKE_ACCELERATOR_CLASS));
+                     if (own) port = own;
+                 }
+             }
+diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
+index 6510f3d..2c0c723 100644
+--- a/NativeBridgeMetalFrontend.mm
++++ b/NativeBridgeMetalFrontend.mm
+@@ -6,6 +6,7 @@
+ // refuses fails its command buffer (status Error, handlers run) instead of being dropped. A selector this frontend does not implement is
+ // reported through the missing-selector hook before the usual exception, so a hardware run names the gap.
+ // Shared events work within this process (no cross-process handle yet). Not yet implemented here: heaps, argument buffers, indirect commands, drawables/presentation.
++#include "UkeRenderServer.h"
+ #import <Foundation/Foundation.h>
+ #import <Metal/Metal.h>
+ #import <IOSurface/IOSurfaceRef.h>
+@@ -221,7 +222,7 @@ static uint32_t threadCpuUs() {
+  return (uint32_t)((uint64_t)(info.user_time.seconds+info.system_time.seconds)*1000000ull+(uint64_t)(info.user_time.microseconds+info.system_time.microseconds));
+ }
+ static uint32_t threadIdLow() {uint64_t id=0;pthread_threadid_np(NULL,&id);return (uint32_t)id;}
+-static bool traceWanted() {static const bool on=diagOn() && !strcmp(getprogname(),"backboardd");return on;}
++static bool traceWanted() {static const bool on=diagOn() && !strcmp(getprogname(),UKE_RENDER_SERVER);return on;}
+ static void tracePush(const TraceRec &rec) {
+  if(!traceWanted())return;
+  if(rec.type==12 && (rec.a>=40 || !native_gpu_latency_stage(rec.a)))return;
+@@ -341,7 +342,7 @@ static void traceStartWriter() {
+  // The file is the render server's: SpringBoard, which runs as the same user, opened the same path with O_TRUNC and the two processes'
+  // records overwrote each other's at their own offsets (untagged-3f2bd680: SpringBoard's header, two interleaved stage sequences).
+  // Only the render server writes the file; no other process reads its Turnip rings.
+- static const bool render=!strcmp(getprogname(),"backboardd");
++ static const bool render=!strcmp(getprogname(),UKE_RENDER_SERVER);
+  if(!diagOn() || !render)return;
+  bool expected=false;
+  if(!gTraceStarted.compare_exchange_strong(expected,true))return;
+@@ -540,7 +541,7 @@ static void noteProblem(NSString *what) {
+ // the display shows the surfaces it composed last until backboardd restarts (the hang's evidence is in the host's KGSL log
+ // and the context's loss mask, not here). End it once its completed handlers have seen the error; launchd starts it
+ // again, SpringBoard with it, and the screen comes back at the lock screen. Other clients get AccessRevoked and decide.
+-static bool isRenderServer() {static const bool renderServer=!strcmp(getprogname(),"backboardd");return renderServer;}
++static bool isRenderServer() {static const bool renderServer=!strcmp(getprogname(),UKE_RENDER_SERVER);return renderServer;}
+ static void endRenderServerAfterGpuLoss() {
+  static std::atomic<bool> ending{false};
+  if(!isRenderServer() || ending.exchange(true))return;
+@@ -908,7 +909,7 @@ - (void)replacePvrtcRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level slice:(NSU
+ - (void)countUse;
+ @end
+ // The render server counts the surfaces it textures in use while the textures live (countUse).
+-static const bool gCountsSurfaceUse=!strcmp(getprogname(),"backboardd");
++static const bool gCountsSurfaceUse=!strcmp(getprogname(),UKE_RENDER_SERVER);
+ // A no-copy import keeps its pages until the runtime frees it, which can be after the buffer object goes (a command buffer still using
+ // it). The owner's release (Metal's deallocator, an IOSurface's mapping) waits for that, as Metal's does: run earlier, the owner could
+ // unmap or reuse pages the GPU still reads or writes.
+diff --git a/NativeTurnipSmoke.h b/NativeTurnipSmoke.h
+index 4d17e26..009aec0 100644
+--- a/NativeTurnipSmoke.h
++++ b/NativeTurnipSmoke.h
+@@ -12,6 +12,7 @@
+ // "T s<stage> r<VkResult> v<fill words> c<compute words> g<triangle pixels>/<stray pixels> <first Vulkan error message>".
+ #pragma once
+ #define VK_NO_PROTOTYPES 1
++#include "UkeRenderServer.h"
+ #include <vulkan/vulkan_core.h>
+ #include "SharedShaderCache.h"
+ #include "NativeTurnipShaders.h"   // generated: scripts/gen-turnip-smoke-shaders.py
+@@ -431,7 +432,7 @@ static Result run(Marker &&mark, const char *libraryPath) {
+     };
+     // The Darwin backend reaches the driver the same way the plugin does: the AGX accelerator service with open type 0x4147, ABI methods through
+     // an admitted selector. The shader cache uses the same writable per-user directory as the Metal runtime.
+-    setenv("TU_DARWIN_SERVICE", "IOAcceleratorES", 0);
++    setenv("TU_DARWIN_SERVICE", UKE_ACCELERATOR_CLASS, 0);
+     const std::string sharedCache = sharedShaderCacheDirectory();
+     if (!sharedCache.empty()) configureShaderDiskCache(sharedCache);
+     // Concurrent binning (BV running ahead of BR) is a performance feature; its barriers make BR wait for BV timestamps. int-058's
+diff --git a/UkeRenderServer.h b/UkeRenderServer.h
+new file mode 100644
+index 0000000..11e0da4
+--- /dev/null
++++ b/UkeRenderServer.h
+@@ -0,0 +1,17 @@
++// SPDX-License-Identifier: MIT
++// uke macOS 26.5: the process that owns the GPU and the IOKit class the kernel publishes differ from iPadOS. On macOS the
++// render server is WindowServer and the accelerator is UkeGpu's AGXAccelerator, an IOAccelerator (boot/macos-gpu), not
++// IOAcceleratorES; the Metal discovery (MTLIOAccelServiceGlobalContext) matches IOAccelerator.
++#pragma once
++#include <TargetConditionals.h>
++#if TARGET_OS_OSX
++#define UKE_RENDER_SERVER "WindowServer"
++#define UKE_ACCELERATOR_CLASS "IOAccelerator"
++#define UKE_RENDER_CACHE_LEAF "com.apple.WindowServer"
++#define UKE_FALLBACK_CACHE "/private/var/tmp/m2v"
++#else
++#define UKE_RENDER_SERVER "backboardd"
++#define UKE_ACCELERATOR_CLASS "IOAcceleratorES"
++#define UKE_RENDER_CACHE_LEAF "com.apple.backboardd"
++#define UKE_FALLBACK_CACHE "/var/mobile/tmp/m2v"
++#endif
