@@ -28,7 +28,6 @@ Key GPU fixes (in `gpu/patches/`):
 Still broken:
 
 - **Performance**: there are many fence-wait timeouts while the GPU is mostly idle. This is the next thing being investigated.
-- Stray triangles in the window-open animation. The translator gives the same output as Metal on the host, so the fault is on the device side.
 - A mosaic when rotating the tablet.
 - Occasional hangs on warm reboot; cold boots are fine.
 - No battery reading on macOS yet (the iPadOS SPMI ADC driver is still to be ported), and no thermal CPU governor.

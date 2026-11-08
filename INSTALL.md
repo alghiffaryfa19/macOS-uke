@@ -198,4 +198,4 @@ Make the trust cache with `make-drv.py trustcache ipsw/macos26/fullos/full-os.tr
 
 ## Known problems
 
-See the README: performance (fence waits), stray triangles in the window animations, a mosaic when rotating, warm-reboot hangs, and no battery or thermal governor yet.
+See the README: performance (fence waits), a mosaic when rotating, warm-reboot hangs, and no battery or thermal governor yet.
