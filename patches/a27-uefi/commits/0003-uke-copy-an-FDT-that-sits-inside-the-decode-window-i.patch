@@ -1,0 +1,61 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Daniel <daniel@Mac-mini-de-Daniel.local>
+Date: Tue, 3 Nov 2026 23:34:51 +0100
+Subject: [PATCH 3/4] uke: copy an FDT that sits inside the decode window
+ instead of refusing; status codes for every refusal
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../Drivers/UkeBootMemoryDxe/UkeBootMemoryDxe.c    | 14 ++++++++++++--
+ 1 file changed, 12 insertions(+), 2 deletions(-)
+
+diff --git a/Platforms/Xiaomi/ukePkg/Drivers/UkeBootMemoryDxe/UkeBootMemoryDxe.c b/Platforms/Xiaomi/ukePkg/Drivers/UkeBootMemoryDxe/UkeBootMemoryDxe.c
+index 93cc6724..21c59c3f 100644
+--- a/Platforms/Xiaomi/ukePkg/Drivers/UkeBootMemoryDxe/UkeBootMemoryDxe.c
++++ b/Platforms/Xiaomi/ukePkg/Drivers/UkeBootMemoryDxe/UkeBootMemoryDxe.c
+@@ -421,6 +421,7 @@ PublishInitrd (
+   mMemStatus.InitrdEnd   = End;
+   if (End <= Start) {
+     DEBUG ((DEBUG_ERROR, "UKEMEM: initrd 0x%lx-0x%lx is empty\n", Start, End));
++    mMemStatus.InitrdPublished = 9;
+     return;
+   }
+ 
+@@ -441,6 +442,7 @@ PublishInitrd (
+   Status = gDS->GetMemorySpaceDescriptor (Start, &Descriptor);
+   if (EFI_ERROR (Status)) {
+     DEBUG ((DEBUG_ERROR, "UKEMEM: initrd descriptor 0x%lx %r\n", Start, Status));
++    mMemStatus.InitrdPublished = 10;
+     return;
+   }
+   DEBUG ((DEBUG_ERROR, "UKEMEM: initrd GCD type %u range 0x%lx +0x%lx\n",
+@@ -495,12 +497,19 @@ PublishInitrd (
+     if ((PackedSize > End - Start - 8) || (PackedSize == 0)) { mMemStatus.InitrdPublished = 4; return; }
+     Result = UefiDecompressGetInfo ((VOID *)(UINTN)Start, PackedSize + 8,
+                                    &ExpandedSize, &ScratchSize);
+-    if (RETURN_ERROR (Result) || ExpandedSize != Capacity ||
+-        (FdtStart < Destination + Capacity && FdtEnd > Destination)) {
++    if (RETURN_ERROR (Result) || ExpandedSize != Capacity) {
+       DEBUG ((DEBUG_ERROR, "UKEMEM: compressed initrd rejected (%r, %u bytes)\n", Result, ExpandedSize));
+       mMemStatus.InitrdPublished = 4;
+       return;
+     }
++    // The ABL puts the FDT just below the initrd, which on this unit is inside the decode window. Nothing
++    // after this point reads the FDT (the payload brings its own ADT); keep a pool copy for the status table.
++    if (FdtStart < Destination + Capacity && FdtEnd > Destination) {
++      VOID *FdtCopy = AllocateCopyPool ((UINTN)(FdtEnd - FdtStart), Fdt);
++      if (FdtCopy == NULL) { mMemStatus.InitrdPublished = 6; return; }
++      mMemStatus.Dtb = (UINT64)(UINTN)FdtCopy;
++      DEBUG ((DEBUG_ERROR, "UKEMEM: FDT 0x%lx is inside the decode window, copied to 0x%p\n", FdtStart, FdtCopy));
++    }
+     Status = gDS->GetMemorySpaceDescriptor (Destination, &Descriptor);
+     if (EFI_ERROR (Status) || Descriptor.GcdMemoryType != EfiGcdMemoryTypeReserved ||
+         Destination < Descriptor.BaseAddress ||
+@@ -534,6 +543,7 @@ PublishInitrd (
+     End &= ~((UINT64)RAM_BLOCK_SIZE - 1);
+     DEBUG ((DEBUG_ERROR, "UKEMEM: initrd end rounded to 0x%lx\n", End));
+     if (End <= Start) {
++      mMemStatus.InitrdPublished = 11;
+       return;
+     }
+   }

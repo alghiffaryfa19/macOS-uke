@@ -2,7 +2,7 @@
 # Attach the full-OS container image read-write, mount its Data volume (found by UUID, never by name), run
 # macos-skip-setup.py on it, then unmount and detach. Usage: sudo boot/apply-skip-setup.sh
 set -euo pipefail
-D=/Users/daniel/Desktop/Deliver/Domotica
+D=${UKE_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}
 IMG=$D/ipsw/macos26/fullos/25F71__MacOS/094-56453-087.dmg
 DATA_UUID=$(cat $D/ipsw/macos26/fullos/data-uuid.txt)
 MNT=/private/tmp/uke-fullos-data

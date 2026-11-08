@@ -1,0 +1,37 @@
+diff --git a/scripts/make-data-seed.py b/scripts/make-data-seed.py
+index eeaf3cb..e044c9e 100644
+--- a/scripts/make-data-seed.py
++++ b/scripts/make-data-seed.py
+@@ -36,6 +36,7 @@ def main():
+     parser.add_argument('--gib', type=int, required=True)
+     parser.add_argument('--build', required=True)
+     parser.add_argument('--skip-setup', action='store_true')
++    parser.add_argument('--jb', type=Path, help='a /var/jb tree (Procursus rootless bootstrap) to place at the seed root as jb/')
+     args = parser.parse_args()
+     source = args.os_mount / 'private/var'
+     if not (args.os_mount / 'sbin/launchd').is_file() or not source.is_dir():
+@@ -48,7 +49,12 @@ def main():
+     with tempfile.TemporaryDirectory(prefix='new-data-', dir=args.output.parent) as td:
+         work = Path(td)
+         raw = work / 'seed.cdr'
+-        subprocess.run(['hdiutil', 'create', '-size', '32m', '-layout', 'NONE', '-fs', 'APFS',
++        # 32 MiB holds a fresh OS /private/var; a bootstrap tree (/var/jb) needs room before the grow step.
++        size = '32m'
++        if args.jb:
++            jb_bytes = sum(p.stat().st_size for p in args.jb.rglob('*') if p.is_file() and not p.is_symlink())
++            size = f'{max(64, jb_bytes // (1 << 20) * 3 // 2 + 96)}m'
++        subprocess.run(['hdiutil', 'create', '-size', size, '-layout', 'NONE', '-fs', 'APFS',
+                         '-volname', 'Data', '-type', 'UDTO', raw], check=True)
+         mount = work / 'mount'
+         mount.mkdir()
+@@ -89,6 +95,10 @@ def main():
+                 for name in ('backboardd', '.GlobalPreferences'):
+                     merge(mount, home, name, dict(CAEnableDeepFramebuffer=False,
+                           CAEnableFramebufferCompression=False, CAEnableIOSurfaceCompression=False))
++            # The Data volume mounts at /private/var, so the Procursus rootless bootstrap's /var/jb tree goes at the seed
++            # root as jb/. shutil.copytree keeps the file modes (the mount ignores ownership); daemons run as root anyway.
++            if args.jb:
++                shutil.copytree(args.jb, mount / 'jb', symlinks=True)
+         finally:
+             subprocess.run(['hdiutil', 'detach', device], check=True)
+         base = work / 'base.dbr'

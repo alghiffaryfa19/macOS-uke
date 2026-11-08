@@ -3,8 +3,9 @@
 # without running its scripts: stage the kernel SDK, install headers, archive, then link.
 # Usage: macos-kbuild.sh [stage|headers|archive|all]   (default all)
 set -e
-FS=/Users/daniel/Desktop/Deliver/Domotica/refs/macOS-ForSheng
-KDK=/Users/daniel/Desktop/Deliver/Domotica/ipsw/macos26/kdk/expanded
+D=${UKE_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}
+FS=$D/refs/macOS-ForSheng
+KDK=${KDK:-$D/ipsw/macos26/kdk/expanded}
 OUT=$FS/out/macos26-xnu-arm64e
 SRC=$OUT/source
 SDK=$OUT/kernel-sdk

@@ -1,0 +1,13 @@
+diff --git a/board.toml b/board.toml
+index 98d69d8..c81f9af 100644
+--- a/board.toml
++++ b/board.toml
+@@ -189,7 +189,7 @@ trust_cache_sha256 = ["dc655bcb2ddfaea214f9ec83659b3fc8d8b658bafac2b5a004fb4179a
+ volume = "UKEESP"
+ # The 24A446 fileset kernel is ~91 MiB; the stock vendor_boot partition is 96 MiB, so the FAT volume
+ # sits near the ceiling (payload + DTB + table must stay under it).
+-size_mib = 160
++size_mib = 288
+ compression = "uefi"
+ # Historical FAT geometry/split workarounds are retained for this diagnostic to avoid changing
+ # multiple boot inputs. The old 65,536-cluster truncation explanation was withdrawn after the

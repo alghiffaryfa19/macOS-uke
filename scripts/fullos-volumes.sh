@@ -5,7 +5,7 @@
 # data-uuid.txt and group Data with System by hand (diskutil -groupWith refuses on the IPSW volume, -69624).
 # No sudo needed. Next: sudo boot/fullos-populate.sh, then boot/macos-full-root.py plan.
 set -euo pipefail
-D=/Users/daniel/Desktop/Deliver/Domotica
+D=${UKE_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}
 F=$D/ipsw/macos26/fullos
 IMG=$F/25F71__MacOS/094-56453-087.dmg
 SYS_UUID=47719F50-5527-44A3-9F59-8170528D8C14

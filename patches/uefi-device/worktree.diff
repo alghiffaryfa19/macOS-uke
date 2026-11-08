@@ -1,0 +1,177 @@
+diff --git a/board.toml b/board.toml
+index 4f921dd..55b3a91 100644
+--- a/board.toml
++++ b/board.toml
+@@ -1,10 +1,10 @@
+-# Board description of the Xiaomi Pad 6S Pro (sheng, SM8550), read by the unixnu build driver.
++# Board description of the Xiaomi Pad 7 (uke, SM7675), read by the unixnu build driver.
+ 
+ [board]
+ name = "uke"
+ soc = "SM7675"
+ description = "Xiaomi Pad 7"
+-kit = "uke"                      # the package/ of this repository appears as kits/sheng in the build tree
++kit = "uke"                      # the package/ of this repository appears as kits/uke in the build tree
+ 
+ # The target OS image: the unchanged iPad7,1 iPadOS 17.7.11 restore image. Give --ipsw PATH to use a local file; without
+ # it the remote url is read with range requests, only the members that are needed.
+@@ -26,7 +26,7 @@ fetch = ["KernelCache", "DeviceTree", "StaticTrustCache", "Cryptex1,SystemTrustC
+ # first_lba and last_lba are the GPT entry "userdata" of LUN 0, read from the tablet.
+ [userdata]
+ first_lba = 0x2d3000
+-last_lba = 0x3b147fa
++last_lba = 0x1d497fa
+ lba_bytes = 4096
+ windows = [
+   { name = "OS", component = "OS" },
+@@ -54,6 +54,7 @@ archives = [
+   "build-libpthread-kernel.py",
+   "build-native-legacy-display.py",
+   "build-boot-log.py",
++  "build-ath12k-wifi.py",
+ ]
+ 
+ # Adreno 732 (uke) board values for the native GPU driver. The driver currently
+@@ -227,6 +228,8 @@ kernel_args = [
+   "armcpu-spi-ipi=1",
+   "-no_slto_panic",
+   "ml-timeout-lock-panic-scale=40",
++  "uke-wifi=1",
++  "sheng-touch=4",
+ ]
+ # Fixups of signed text, applied by the kernel after signature validation (patches/xnu/native-text-fixup.patch); they reach it as
+ # /chosen/text-fixups, not on the command line. Each is <file name>,<file offset>,<original>,<replacement>, in hex. uke runs the
+@@ -237,11 +240,14 @@ text_fixups = [
+   "dyld_shared_cache_arm64.15,421e8bc,28ad1bb0008544f9,c0035fd6008544f9",
+   "dyld_shared_cache_arm64.13,1b05bec,44008052,24008052",
+   "dyld_shared_cache_arm64.13,1b05b08,44008052,24008052",
+-  # BTAudioHALPlugin's factory returns NULL, so audiomxd skips it: with bluetoothd disabled (sheng-lite) the plugin reconnects to the
++  # BTAudioHALPlugin's factory returns NULL, so audiomxd skips it: with bluetoothd disabled (uke-lite) the plugin reconnects to the
+   # audio device and hangs audiomxd's startup (int-141), which keeps the speaker from ever being ready.
+   "BTAudioHALPlugin,38bec,ffc300d1f44f01a9,000080d2c0035fd6",
+ ]
+ 
++[components]
++include = ["ArmDTPlatform", "ArmCpu", "NativeAES", "NativeUfs", "NativeRamBlock", "Adreno732", "AdrenoMetal", "GopFramebuffer", "ShengHidInput", "NativeNovatekTouch", "QcomGeniSpi", "AppleKeyStoreState", "XnuPrelink", "DarwinBoot", "VerifiedRoot", "UkePreflight", "AirNir", "Ath12kWifi"]
++
+ [payload.adt]
+ tool = "scripts/make-uke-adt.py"
+ chip_id = "207"
+@@ -253,7 +259,7 @@ root_match_volume_uuid = "04769D26-2CA0-4825-B443-E2E5F88300F2"
+ boot_manifest_hash = "5fd2fc139b688ddf071aa815c1ea75d26bcd994a528cf02e365661eab5139ec7b580d63ca9319e218962a2236f23faca"
+ cpu_regs = "0,0x100,0x200,0x300,0x400,0x500,0x600,0x700"
+ packed_data_ramdisk = true
+-persistent_data = true               # sheng-data-persist keeps Data writes, so Data is not ephemeral storage
++persistent_data = true               # uke-data-persist keeps Data writes, so Data is not ephemeral storage
+ ipad_identity = true
+ unique_chip_id = "required"          # the platform seed is not stored in any repository
+ 
+diff --git a/package/TouchProbe.cpp b/package/TouchProbe.cpp
+index 85b131f..3c07ece 100644
+--- a/package/TouchProbe.cpp
++++ b/package/TouchProbe.cpp
+@@ -18,7 +18,7 @@ extern "C" {
+ #include "../../drivers/NativeGeniSpi/GeniSpi.h"
+ #include "../../drivers/NativeNovatekTouch/NvtProtocol.h"
+ #include "../../drivers/NativeNovatekTouch/NvtTouchCore.h"
+-#include "TouchBoard.h"
++#include "TouchBoard_uke.h"
+ #include "SmmuBypass.h"
+ extern const uint8_t native_touch_firmware[] __attribute__((weak_import));
+ extern const uint32_t native_touch_firmware_size __attribute__((weak_import));
+@@ -352,7 +352,7 @@ bool enable(Session &s) {
+     s.vals[4] = rd32(s.gccHalt.va, TB_HALT_CORE_2X & 0xfff);
+     s.vals[5] = rd32(s.gccS4.va, TB_HALT_S4 & 0xfff);
+     if (!ok) {fail(2, -110); return false;}   // never touch the engine without running clocks
+-    const uint32_t cfg = tb_pin_cfg(TB_FUNC_QUP1_SE4, TB_DRIVE_6MA);
++    const uint32_t cfg = tb_pin_cfg(TB_FUNC_QUP0_SE4, TB_DRIVE_6MA);
+     for (unsigned i = 0; i < 4; ++i) wr32(s.tlmmSpi.va, i * TB_GPIO_STRIDE, cfg);
+     for (unsigned i = 0; i < 4; ++i) s.vals[9 + i] = rd32(s.tlmmSpi.va, i * TB_GPIO_STRIDE);
+     mark(s, 3);   // the next accesses touch the engine: if the page freezes here, the engine access hung
+diff --git a/scripts/make-uke-adt.py b/scripts/make-uke-adt.py
+index 3548279..6bc6c7f 100755
+--- a/scripts/make-uke-adt.py
++++ b/scripts/make-uke-adt.py
+@@ -42,6 +42,17 @@ UFS_PHY_SIZE = 0x2000
+ # llcc_lpi_region@ff800000 reservation.
+ PANIC_LOG_BASE = 0xFF800000
+ PANIC_LOG_SIZE = 0x00380000
++# GPU contiguous memory reservation: the Adreno 732 GMU stage 4 calls
++# vm_page_find_contiguous() which fails because XNU cannot find a large
++# enough free physically contiguous region. Fix: pre-reserve 8 MiB and
++# have the GPU driver adopt it via IODeviceMemory::withRange().
++# Values: gmem 0x180000 + preempt 0x418000 + GMU buffers ~0x200000 ≈ 7.7 MiB → 8 MiB.
++GPU_MEM_SIZE = 0x00800000  # 8 MiB
++# GPU register bases (from board.toml [gpu] section)
++GPU_BASE = 0x3d00000
++GPU_SIZE = 0x40000
++GMU_BASE = 0x3d68000
++GMU_SIZE = 0x37000
+ 
+ 
+ def node(name, properties=(), children=()):
+@@ -99,6 +110,10 @@ def main():
+                              'SM7675 numbers its cores 0x000..0x700 in Affinity1 (sm8550.dtsi). More than one adds /psci')
+     parser.add_argument('--psci-method', choices=['smc', 'hvc'], default='smc',
+                         help='/psci method used by the secondary-CPU start (the board DT declares smc)')
++    parser.add_argument('--gpu-reserved-size', type=lambda value: int(value, 0), default=GPU_MEM_SIZE,
++                        help='GPU contiguous memory reservation in bytes (default 8 MiB); 0 disables')
++    parser.add_argument('--gpu-reserved-base', type=lambda value: int(value, 0), default=None,
++                        help='Explicit GPU reserved base address; default: top of owned DRAM')
+     parser.add_argument('--packed-data-ramdisk', action='store_true', help='Hand off validated DBRDISK1 bytes to the native sparse block driver, without a dense memdev alias')
+     parser.add_argument('--data-ramdisk', action='store_true',
+                         help='/chosen/memory-map RAMDisk placeholder; the loader fills in the real range for a scratch Data seed')
+@@ -127,6 +142,14 @@ def main():
+             or args.owned_memory_size % 0x200000):
+         parser.error('Owned memory must be 256 MiB to 8 GiB, aligned to 2 MiB')
+ 
++    gpu_mem_base = args.gpu_reserved_base
++    gpu_mem_size = args.gpu_reserved_size
++    if gpu_mem_size and not gpu_mem_base:
++        # Carve from the top of the owned DRAM range
++        owned = args.owned_memory_size or 0x10000000
++        gpu_mem_base = args.dram_base + owned - gpu_mem_size
++        gpu_mem_base &= ~0x1FFFFF  # 2 MiB aligned
++
+     try:
+         cpu_regs = [int(value, 0) for value in args.cpu_regs.split(',')]
+     except ValueError:
+@@ -222,6 +245,17 @@ def main():
+                              ('artwork-display-gamut', b'P3\0'),
+                              ('compatible-device-fallback', b'iPad6,7\0'),
+                              ('thin-bezel', struct.pack('<I', 1))] if args.ipad_identity else [] )]),
++        # GPU contiguous memory reservation: the GMU needs physically contiguous
++        # pages that vm_page_find_contiguous() cannot satisfy from fragmented free
++        # lists. This node lets the GPU driver adopt the range with
++        # IODeviceMemory::withRange() instead.
++        *([node('reserved-memory', [('#address-cells', struct.pack('<I', 2)),
++                                     ('#size-cells', struct.pack('<I', 2)),
++                                     ('ranges', b'')],
++                [node('gpu-memory', [('reg', struct.pack('<QQ', gpu_mem_base, gpu_mem_size)),
++                                      ('no-map', b''),
++                                      ('compatible', b'qcom,adreno-smmu-guard\0')])])]
++          if gpu_mem_size else []),
+         node('arm-io', [('device_type', b'arm-io\0'),
+                         ('#address-cells', struct.pack('<I', 2)),
+                         ('#size-cells', struct.pack('<I', 2)),
+@@ -231,10 +265,16 @@ def main():
+                                                 GIC_DIST - ARMIO_BASE, GIC_DIST_SIZE,
+                                                 GIC_REDIST - ARMIO_BASE, GIC_REDIST_SIZE)),
+                             ('redistributor-stride', struct.pack('<Q', 0x40000))]),
+-              # UFS (0x1d84000) lies below the arm-io window, so a child reg offset would be
+-              # negative. The node exists only for class matching; NativeUfs takes its
+-              # physical windows from the board DT constants in GccUfs.h.
+-              node('ufshc', [('compatible', b'qcom,sm8550-ufshc\0')])]),
++              node('ufshc', [('compatible', b'qcom,sm8550-ufshc\0')]),
++              # GPU (Adreno 732) and GMU: the driver reads gpu-memory-base
++              # and gpu-memory-size to locate the pre-reserved contiguous region.
++              *([node('gpu', [('compatible', b'qcom,adreno-gpu-gen7-11-0\0'),
++                               ('reg', struct.pack('<QQ', GPU_BASE, GPU_SIZE)),
++                               ('gpu-memory-base', struct.pack('<Q', gpu_mem_base)),
++                               ('gpu-memory-size', struct.pack('<Q', gpu_mem_size))]),
++                 node('gmu', [('compatible', b'qcom,adreno-gmu-732\0'),
++                               ('reg', struct.pack('<QQ', GMU_BASE, GMU_SIZE))])]
++                if gpu_mem_size else [])]),
+     ])
+     args.output.parent.mkdir(parents=True, exist_ok=True)
+     args.output.write_bytes(tree)

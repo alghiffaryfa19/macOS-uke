@@ -7,7 +7,7 @@
 # Usage: [GOP=1] [FAT_MIB=92] boot/make-macos-image.sh [extra boot args...]
 #   GOP=1: the ADT enables the NativeGOPDisplay framebuffer (pass native-gop-display=1 too)
 set -euo pipefail
-D=/Users/daniel/Desktop/Deliver/Domotica
+D=${UKE_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}
 FS=$D/refs/macOS-ForSheng
 DEV=$D/UniXNU-uke-kbuild-ios26
 OUT=$D/boot/out
@@ -39,10 +39,10 @@ python3 -I "$DEV/scripts/make-uke-adt.py" --output "$P/kernel.macho.adt" --dram-
   --dram-base 0x8C0000000 --owned-memory-size ${OWNED_MEM:-0x130000000} --chip-id 207 \
   --cpu-regs $CPU_REGS --os-environment $OS_ENV --root-match-volume-uuid $ROOT_UUID \
   --unique-chip-id "$(tr -d ' \n' < "$D/boot/chip-id.txt")" ${TRUSTCACHE:+--trust-cache}
-"$FS/.venv/bin/python" - "$P/kernel.macho.adt" "$D/ipsw/macos26/basesystem.root_hash.bin" $ROOT_UUID "${GOP:-0}" "${FULL:-0}" <<'EOF'
+FS_SCRIPTS=$FS/scripts "$FS/.venv/bin/python" - "$P/kernel.macho.adt" "$D/ipsw/macos26/basesystem.root_hash.bin" $ROOT_UUID "${GOP:-0}" "${FULL:-0}" <<'EOF'
 import os, sys, uuid
 from pathlib import Path
-sys.path.insert(0, '/Users/daniel/Desktop/Deliver/Domotica/refs/macOS-ForSheng/scripts')
+sys.path.insert(0, os.environ['FS_SCRIPTS'])
 from native_devtree import configure_native_text_state
 sip0 = int(os.environ.get('SIP0', '0'), 0)   # lp-sip0 csr flags; 0x7f is "csrutil disable" (launchd then honours disabled.plist)
 if sys.argv[5] == '1':   # full macOS: unsealed system volume, so no recovery root hash or boot volume identity

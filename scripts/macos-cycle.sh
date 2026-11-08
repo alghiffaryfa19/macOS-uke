@@ -6,9 +6,9 @@
 #   boot/macos-cycle.sh summary M2y       summary of an already pulled log
 # Never flashes userdata. OrangeFox is reached by the ROM boot/vendor_boot (fastboot boot of OrangeFox fails: Bad Buffer Size).
 set -euo pipefail
-D=/Users/daniel/Desktop/Deliver/Domotica
+D=${UKE_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}
 L=$D/boot/macoslog
-ROM=~/Desktop/woa-uke/device_dumps/backup-pre-windows
+ROM=${UKE_ROM:-~/Desktop/woa-uke/device_dumps/backup-pre-windows}   # stock boot.img + vendor_boot.img of your ROM
 GUARD_LBA=30693903
 LOG_LBA=30693392
 

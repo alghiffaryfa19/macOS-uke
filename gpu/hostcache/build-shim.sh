@@ -3,7 +3,7 @@
 # with the tablet's device identity (GpuPowerProbe.cpp gDeviceInfo: chip 0x43030b00, GMEM 1.5 MiB), so the tablet's own Turnip
 # and plugin compile on this Mac exactly what they compile on the tablet. Output: hostcache/out/libhostiokit.dylib.
 set -euo pipefail
-D=/Users/daniel/Desktop/Deliver/Domotica; R=$D/UniXNU-a27; W=$D/boot/macos-gpu/hostcache; O=$W/out
+D=${UKE_ROOT:-$(cd "$(dirname "$0")/../../.." && pwd)}; R=$D/UniXNU-a27; W=$D/boot/macos-gpu/hostcache; O=$W/out
 kit=$D/boot/macos-gpu/src/drivers/Adreno740; sim=$R/drivers/Adreno740/tests/hostsim; smmu=$D/boot/macos-gpu/src/kits/ArmSmmu4K
 mkdir -p $O/host-include/sys $O/host-include/IOKit $O/host-include/kern $O/src
 for n in IOKit/IOTypes.h IOKit/IOReturn.h IOKit/IOBufferMemoryDescriptor.h IOKit/IOLib.h kern/task.h; do echo '#include "XnuMemoryFixture.h"' > $O/host-include/$n; done

@@ -1,0 +1,43 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Daniel <daniel@Mac-mini-de-Daniel.local>
+Date: Tue, 3 Nov 2026 23:51:21 +0100
+Subject: [PATCH 1/2] uke: acknowledge hypervisor-raised SGIs/PPIs instead of
+ panicking
+
+The Gunyah hypervisor on the Xiaomi Pad 7 raises architectural IRQ 13
+(SGI 7 on the iOS 17 line); XNU has no work for it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ ArmCpu.cpp | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/ArmCpu.cpp b/ArmCpu.cpp
+index 2dc44dd..32fbe99 100644
+--- a/ArmCpu.cpp
++++ b/ArmCpu.cpp
+@@ -37,6 +37,8 @@ volatile uint32_t armcpu_irq_phase = 0,armcpu_irq_id = 1023;
+ // of timer pops is normal under a hypervisor: a vCPU held off its core finds the next deadline rtclock_intr set already past
+ // when it signals end of interrupt, and the virtual timer fires again.
+ volatile uint64_t armcpu_irq_long_drains = 0;
++volatile uint64_t armcpu_arch_unhandled = 0;   // SGIs/PPIs other than SGI 0 and the timer PPI 27 (hypervisor-raised)
++volatile uint32_t armcpu_arch_unhandled_id = 0;
+ volatile uint32_t armcpu_irq_drain_most = 0;
+ volatile uint32_t armcpu_quiesce_calls = 0,armcpu_halt_calls = 0;
+ // Secondary-CPU bring-up evidence (sheng-smp=1). Step values: 1 nub started, 2 registered, 3 start thread running,
+@@ -650,6 +652,15 @@ void ArmCpu::interrupt (void)
+         armcpu_spi_unhandled = armcpu_spi_unhandled + 1;
+         armcpu_spi_unhandled_id = intid;
+         write32 (gDist, 0x180 + (intid / 32) * 4, 1U << (intid % 32));
++      } else if (intid < 32) {
++        // uke: the Gunyah hypervisor raises SGIs/PPIs of its own (13 here, 7 on the iOS 17 line). They carry no work
++        // for XNU; acknowledge them like an unclaimed SPI instead of panicking. The first few are logged.
++        armcpu_arch_unhandled = armcpu_arch_unhandled + 1;
++        armcpu_arch_unhandled_id = intid;
++        if (armcpu_arch_unhandled <= 8) {
++          kprintf ("ArmCpu: ignored architectural IRQ %u on cpu %u (%llu so far)\n", intid, logicalId,
++                   armcpu_arch_unhandled);
++        }
+       } else {
+         panic ("ArmCpu: unexpected architectural IRQ %llu", id);
+       }

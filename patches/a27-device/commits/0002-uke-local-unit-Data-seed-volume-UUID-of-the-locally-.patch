@@ -1,0 +1,44 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Daniel <daniel@Mac-mini-de-Daniel.local>
+Date: Tue, 3 Nov 2026 23:46:35 +0100
+Subject: [PATCH 2/4] uke (local unit): Data seed volume UUID of the locally
+ built 88 GiB seed
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ configs/uke_ipados27_defconfig | 2 +-
+ unixnu.lock                    | 5 ++++-
+ 2 files changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/configs/uke_ipados27_defconfig b/configs/uke_ipados27_defconfig
+index 1b92531..d2fd882 100644
+--- a/configs/uke_ipados27_defconfig
++++ b/configs/uke_ipados27_defconfig
+@@ -33,4 +33,4 @@ CONFIG_XNU_OWNER_CRYPTEX_FILES=n
+ CONFIG_XNU_OWNER_UNION_SYSTEMOS=y
+ CONFIG_XNU_OWNER_BOOT_MANIFEST=y
+ CONFIG_XNU_OWNER_DATA_MOUNT=y
+-CONFIG_XNU_OWNER_DATA_VOLUME_UUID="292E72B9-7594-431D-ADBC-2D354CC918DD"
++CONFIG_XNU_OWNER_DATA_VOLUME_UUID="E62EAE8A-74DA-47BF-B286-EFF097D6626E"
+diff --git a/unixnu.lock b/unixnu.lock
+index db4d18c..8ae2bbe 100644
+--- a/unixnu.lock
++++ b/unixnu.lock
+@@ -16,7 +16,7 @@ commit = "24f1f3fbed6feff42e1ca02e2ce386a5c3c36da8"
+ commit = "78c93b0941896e0515c6abaad3ff0d88b50a78ca"
+ 
+ [source."Sm8550Platform"]
+-commit = "23b2049fcd9e30356161def84231334fb55ecca9"
++commit = "a9f45dc60c035084b95463781538380f4c3606c9"
+ 
+ [source."corecrypto-2023"]
+ commit = "11fba65b12d8830630e248dfa8344caf8b065f26"
+@@ -33,5 +33,8 @@ commit = "b7ed7cf5cf7dd12b98672435db2225a860f199d8"
+ [source."libpthread"]
+ commit = "1f4f5265b319111142f1bf3a27d4484ef5a98314"
+ 
++[source."sm7675"]
++commit = "7f857a825a3c1f0882a50eaa824249c714d9679d"
++
+ [source."xnu"]
+ commit = "ac9718fb1af618d5ce8678d0dc6e8a58f252216f"

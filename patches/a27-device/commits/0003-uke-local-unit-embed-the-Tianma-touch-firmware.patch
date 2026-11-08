@@ -1,0 +1,24 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Daniel <daniel@Mac-mini-de-Daniel.local>
+Date: Wed, 4 Nov 2026 00:06:24 +0100
+Subject: [PATCH 3/4] uke (local unit): embed the Tianma touch firmware
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ scripts/gen-touch-firmware.py | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/scripts/gen-touch-firmware.py b/scripts/gen-touch-firmware.py
+index 06e4dcd..5df4704 100644
+--- a/scripts/gen-touch-firmware.py
++++ b/scripts/gen-touch-firmware.py
+@@ -11,7 +11,8 @@ from pathlib import Path
+ ROOT = Path(__file__).resolve().parents[1]
+ # o82 is this panel (DT msm_drm.dsi_display0=qcom,mdss_dsi_o82_…); the CSOT/TM variants come from the stock ODM image
+ # (new-port/out/dna/odm/firmware). The TM alternative novatek_nt36532_o82_fw_tm.bin sits next to it.
+-DEFAULT = ROOT / '.cache/firmware/novatek/novatek_nt36532_o82_fw_csot.bin'
++# This unit has the Tianma panel (qcom,mdss_dsi_o82_36_02_0a): the CSOT image downloads but the controller never answers.
++DEFAULT = ROOT / '.cache/firmware/novatek/novatek_nt36532_o82_fw_tm.bin'
+ OUT = ROOT / 'build/native-touch'
+ 
+ 

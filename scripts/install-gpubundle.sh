@@ -6,7 +6,7 @@
 # already in boot/out/full-os-drv.trustcache (cdhashes 9421db53..., 037e3179...). The DRV window still holds the GPU
 # firmware. Volumes are found by UUID inside this image's container only. Usage: sudo boot/install-gpubundle.sh
 set -euo pipefail
-D=/Users/daniel/Desktop/Deliver/Domotica
+D=${UKE_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}
 IMG=$D/ipsw/macos26/fullos/25F71__MacOS/094-56453-087.dmg
 DATA_UUID=$(cat $D/ipsw/macos26/fullos/data-uuid.txt)
 SRC=$D/boot/out/drv-stage/NativeAdrenoMetal.bundle

@@ -19,7 +19,7 @@ import tempfile
 import uuid
 import zlib
 
-D = '/Users/daniel/Desktop/Deliver/Domotica'
+D = os.environ.get('UKE_ROOT') or os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 OS_IMAGE = D + '/ipsw/macos26/fullos/25F71__MacOS/094-56453-087.dmg'
 ISC_IMAGE = D + '/ipsw/macos26/fullos/isc-window.img'
 STATE = D + '/ipsw/macos26/fullos/full-root.json'

@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Daniel <daniel@Mac-mini-de-Daniel.local>
+Date: Sun, 1 Nov 2026 13:50:42 +0100
+Subject: [PATCH 2/2] ios26: dada's platform (patch 086: GenericARMPE, GICv3,
+ PSCI) instead of ArmDTPlatform/ArmCpu; ADT /arm-io/gic and psci-method; one
+ core
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ scripts/make-uke-adt.py | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/scripts/make-uke-adt.py b/scripts/make-uke-adt.py
+index 062dfeb..2f16adb 100755
+--- a/scripts/make-uke-adt.py
++++ b/scripts/make-uke-adt.py
+@@ -158,6 +158,8 @@ def main():
+         ('#size-cells', struct.pack('<I', 2)),
+     ], [
+         node('chosen', [('random-seed', os.urandom(256)),
++                        # dada's psci_smp.c reads the PSCI conduit from here.
++                        ('psci-method', args.psci_method.encode() + b'\0'),
+                         # Without these XNU never publishes IOPlatformUUID and gethostuuid() blocks forever
+                         # for callers (configd) that pass a zero timeout.
+                         *([('unique-chip-id', struct.pack('<Q', args.unique_chip_id)), ('chip-id', struct.pack('<I', args.chip_id))]
+@@ -247,6 +249,12 @@ def main():
+                                                 GIC_DIST - ARMIO_BASE, GIC_DIST_SIZE,
+                                                 GIC_REDIST - ARMIO_BASE, GIC_REDIST_SIZE)),
+                             ('redistributor-stride', struct.pack('<Q', 0x40000))]),
++              # The same GIC under the name hakios-arm64e-dada's gic_v3_irq.c looks up (iOS 26 kernel).
++              node('gic', [('compatible', b'arm,gic-v3\0'),
++                           ('reg', struct.pack('<4Q',
++                                               GIC_DIST - ARMIO_BASE, GIC_DIST_SIZE,
++                                               GIC_REDIST - ARMIO_BASE, GIC_REDIST_SIZE)),
++                           ('redistributor-stride', struct.pack('<Q', 0x40000))]),
+               # UFS (0x1d84000) lies below the arm-io window, so a child reg offset would be
+               # negative. The node exists only for class matching; NativeUfs takes its
+               # physical windows from the board DT constants in GccUfs.h.

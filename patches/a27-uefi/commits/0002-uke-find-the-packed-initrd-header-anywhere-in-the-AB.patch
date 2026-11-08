@@ -1,0 +1,106 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Daniel <daniel@Mac-mini-de-Daniel.local>
+Date: Tue, 3 Nov 2026 23:27:25 +0100
+Subject: [PATCH 2/4] uke: find the packed initrd header anywhere in the ABL
+ range; show the refusal step in ir=
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../UkeBootMemoryDxe/UkeBootMemoryDxe.c       | 37 ++++++++++++++++---
+ 1 file changed, 32 insertions(+), 5 deletions(-)
+
+diff --git a/Platforms/Xiaomi/ukePkg/Drivers/UkeBootMemoryDxe/UkeBootMemoryDxe.c b/Platforms/Xiaomi/ukePkg/Drivers/UkeBootMemoryDxe/UkeBootMemoryDxe.c
+index 03a0599b..93cc6724 100644
+--- a/Platforms/Xiaomi/ukePkg/Drivers/UkeBootMemoryDxe/UkeBootMemoryDxe.c
++++ b/Platforms/Xiaomi/ukePkg/Drivers/UkeBootMemoryDxe/UkeBootMemoryDxe.c
+@@ -449,11 +449,36 @@ PublishInitrd (
+       (Start < Descriptor.BaseAddress) ||
+       (End - Descriptor.BaseAddress > Descriptor.Length)) {
+     DEBUG ((DEBUG_ERROR, "UKEMEM: refusing unreserved initrd 0x%lx-0x%lx\n", Start, End));
++    mMemStatus.InitrdPublished = 2;
+     return;
+   }
+ 
+   // Optional standard UEFI-compressed FAT. The original ABL buffer remains
+   // reserved. Decode only into the lower, disjoint part of that reservation.
++  //
++  // The ABL's initrd range can hold more than the vendor ramdisk (on this unit it is 102 MB for a 43 MB
++  // ramdisk), so look for the packed FAT's header ({packed size, 0x0A000000}) at every page, not only at
++  // the start of the range. The menu's "ir=" shows the step that refused it (2..8) when nothing is published.
++  //
++  if (End - Start >= 512 &&
++      !(((UINT8 *)(UINTN)Start)[510] == 0x55 && ((UINT8 *)(UINTN)Start)[511] == 0xAA)) {
++    UINT64 Probe;
++    for (Probe = Start; Probe + 512 <= End; Probe += SIZE_4KB) {
++      UINT32 Packed = ReadUnaligned32 ((UINT32 *)(UINTN)Probe);
++      if ((ReadUnaligned32 ((UINT32 *)(UINTN)(Probe + 4)) == 0x0A000000u) &&
++          (Packed != 0) && (Packed <= End - Probe - 8)) {
++        if (Probe != Start) {
++          DEBUG ((DEBUG_ERROR, "UKEMEM: packed initrd header at 0x%lx (+0x%lx)\n", Probe, Probe - Start));
++        }
++        Start = Probe;
++        break;
++      }
++    }
++    if (Probe + 512 > End) {
++      mMemStatus.InitrdPublished = 3;
++      return;
++    }
++  }
+   if ((End - Start >= 512) &&
+       (ReadUnaligned32 ((UINT32 *)(UINTN)(Start + 4)) == 0x0A000000u)) {
+     UINT32 PackedSize = ReadUnaligned32 ((UINT32 *)(UINTN)Start);
+@@ -467,23 +492,24 @@ PublishInitrd (
+     CONST UINT64 Capacity = 0x0A000000ULL; // 160 MiB, ends at 0xB2000000
+     UINT64 FdtStart = (UINT64)(UINTN)Fdt;
+     UINT64 FdtEnd = FdtStart + FdtTotalSize (Fdt);
+-    if ((PackedSize > End - Start - 8) || (PackedSize == 0)) { return; }
++    if ((PackedSize > End - Start - 8) || (PackedSize == 0)) { mMemStatus.InitrdPublished = 4; return; }
+     Result = UefiDecompressGetInfo ((VOID *)(UINTN)Start, PackedSize + 8,
+                                    &ExpandedSize, &ScratchSize);
+     if (RETURN_ERROR (Result) || ExpandedSize != Capacity ||
+         (FdtStart < Destination + Capacity && FdtEnd > Destination)) {
+       DEBUG ((DEBUG_ERROR, "UKEMEM: compressed initrd rejected (%r, %u bytes)\n", Result, ExpandedSize));
++      mMemStatus.InitrdPublished = 4;
+       return;
+     }
+     Status = gDS->GetMemorySpaceDescriptor (Destination, &Descriptor);
+     if (EFI_ERROR (Status) || Descriptor.GcdMemoryType != EfiGcdMemoryTypeReserved ||
+         Destination < Descriptor.BaseAddress ||
+-        Destination + Capacity > Descriptor.BaseAddress + Descriptor.Length) { return; }
++        Destination + Capacity > Descriptor.BaseAddress + Descriptor.Length) { mMemStatus.InitrdPublished = 5; return; }
+     // The ABL may place the packed FAT inside the decode window (on this unit it starts at 0xB1E2F000):
+     // decode from a copy so the output never overwrites input that has not been read yet.
+     if (Start < Destination + Capacity) {
+       Copy = AllocatePool (PackedSize + 8);
+-      if (Copy == NULL) { return; }
++      if (Copy == NULL) { mMemStatus.InitrdPublished = 6; return; }
+       CopyMem (Copy, (VOID *)(UINTN)Start, PackedSize + 8);
+       Source = Copy;
+       DEBUG ((DEBUG_ERROR, "UKEMEM: packed initrd 0x%lx overlaps the decode window, decoding a copy\n", Start));
+@@ -491,6 +517,7 @@ PublishInitrd (
+     Scratch = AllocatePool (ScratchSize);
+     if (Scratch == NULL) {
+       if (Copy != NULL) { FreePool (Copy); }
++      mMemStatus.InitrdPublished = 6;
+       return;
+     }
+     Result = UefiDecompress (Source, (VOID *)(UINTN)Destination, Scratch);
+@@ -498,7 +525,7 @@ PublishInitrd (
+     if (Copy != NULL) { FreePool (Copy); }
+     if (RETURN_ERROR (Result) ||
+         ((UINT8 *)(UINTN)Destination)[510] != 0x55 ||
+-        ((UINT8 *)(UINTN)Destination)[511] != 0xAA) { return; }
++        ((UINT8 *)(UINTN)Destination)[511] != 0xAA) { mMemStatus.InitrdPublished = 7; return; }
+     Start = Destination;
+     End = Destination + ExpandedSize;
+     DEBUG ((DEBUG_ERROR, "UKEMEM: UEFI FAT decompressed %u to %u bytes\n", PackedSize, ExpandedSize));
+@@ -513,7 +540,7 @@ PublishInitrd (
+ 
+   if ((End - Start < 512) ||
+       ((UINT8 *)(UINTN)Start)[510] != 0x55 ||
+-      ((UINT8 *)(UINTN)Start)[511] != 0xAA) { return; }
++      ((UINT8 *)(UINTN)Start)[511] != 0xAA) { mMemStatus.InitrdPublished = 8; return; }
+ 
+   mRamBase                = (UINT8 *)(UINTN)Start;
+   mMedia.MediaId          = 1;

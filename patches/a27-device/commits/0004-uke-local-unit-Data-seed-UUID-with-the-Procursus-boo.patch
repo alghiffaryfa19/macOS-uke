@@ -1,0 +1,20 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Daniel <daniel@Mac-mini-de-Daniel.local>
+Date: Wed, 4 Nov 2026 00:59:23 +0100
+Subject: [PATCH 4/4] uke (local unit): Data seed UUID with the Procursus
+ bootstrap in /var/jb
+
+---
+ configs/uke_ipados27_defconfig | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/configs/uke_ipados27_defconfig b/configs/uke_ipados27_defconfig
+index d2fd882..641c2f3 100644
+--- a/configs/uke_ipados27_defconfig
++++ b/configs/uke_ipados27_defconfig
+@@ -33,4 +33,4 @@ CONFIG_XNU_OWNER_CRYPTEX_FILES=n
+ CONFIG_XNU_OWNER_UNION_SYSTEMOS=y
+ CONFIG_XNU_OWNER_BOOT_MANIFEST=y
+ CONFIG_XNU_OWNER_DATA_MOUNT=y
+-CONFIG_XNU_OWNER_DATA_VOLUME_UUID="E62EAE8A-74DA-47BF-B286-EFF097D6626E"
++CONFIG_XNU_OWNER_DATA_VOLUME_UUID="9F07DF73-E867-4820-A161-F4E505119B8D"

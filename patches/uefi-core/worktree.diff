@@ -1,0 +1,99 @@
+diff --git a/scripts/seed-data-grow.py b/scripts/seed-data-grow.py
+index aa6beb1..54550b6 100755
+--- a/scripts/seed-data-grow.py
++++ b/scripts/seed-data-grow.py
+@@ -104,12 +104,15 @@ def main():
+                 handle.seek(offset)
+                 handle.write(data)
+         attached = run('hdiutil', 'attach', '-imagekey', 'diskimage-class=CRawDiskImage', '-nomount', '-nobrowse', str(raw))
+-        store = re.match(r'(/dev/disk\d+)', attached).group(1).split('/')[-1]
++        devices = [line.split()[0].split('/')[-1] for line in attached.splitlines() if re.match(r'/dev/disk\d+\s', line)]
++        # Newer macOS lists the synthesized APFS container first and the whole raw disk (no content type) last.
++        store = next((line.split()[0].split('/')[-1] for line in attached.splitlines()
++                      if re.match(r'/dev/disk\d+\s*$', line.strip())), devices[0])
+         try:
+             listing = plistlib.loads(subprocess.check_output(['diskutil', 'apfs', 'list', '-plist']))
+             container = None
+             for entry in listing['Containers']:
+-                if any(s['DeviceIdentifier'] == store for s in entry.get('PhysicalStores', [])):
++                if any(s['DeviceIdentifier'] in devices for s in entry.get('PhysicalStores', [])):
+                     container = entry['ContainerReference']
+             if not container:
+                 sys.exit('No APFS container found on the attached seed')
+diff --git a/scripts/unixnu/bootimg.py b/scripts/unixnu/bootimg.py
+index 259fb29..a603a57 100644
+--- a/scripts/unixnu/bootimg.py
++++ b/scripts/unixnu/bootimg.py
+@@ -47,7 +47,10 @@ def patch_dtb(dtb, nodes, scratch):
+     work = scratch / 'device.dtb'
+     work.write_bytes(dtb)
+     for node in nodes:
+-        run([fdtput, '-c', work, node['path']], capture=True)
++        try:
++            run([fdtget, '-p', work, node['path']], capture=True)
++        except Error:
++            run([fdtput, '-c', work, node['path']], capture=True)
+         for prop in node.get('props', []):
+             values = prop['value'] if isinstance(prop['value'], list) else [prop['value']]
+             run([fdtput, '-t', prop.get('type', 's'), work, node['path'], prop['name'], *[str(v) for v in values]], capture=True)
+@@ -119,11 +122,18 @@ def build(ctx, uefi, fd, dtb, ramdisk=None, output=None):
+ def verify(path, combined, tree, ramdisk_path, image):
+     """Unpack the image and compare every part with its input."""
+     data = Path(path).read_bytes()
+-    kernel_size, kernel_address, ramdisk_size, _, second_size, _, tags, page, version, _ = struct.unpack_from('<10I', data, 8)
+-    if data[:8] != b'ANDROID!' or second_size or version != image['header_version'] or page != image['pagesize']:
+-        raise Error('boot image header does not match the requested parameters')
+-    if kernel_address != image['base'] + image['kernel_offset'] or tags != image['base'] + image['tags_offset']:
+-        raise Error('boot image load addresses do not match the requested offsets')
++    if image['header_version'] >= 3:
++        kernel_size, ramdisk_size = struct.unpack_from('<2I', data, 8)
++        version, = struct.unpack_from('<I', data, 40)
++        page, kernel_address, tags = 4096, None, None
++        if data[:8] != b'ANDROID!' or version != image['header_version']:
++            raise Error('boot image header does not match the requested parameters')
++    else:
++        kernel_size, kernel_address, ramdisk_size, _, second_size, _, tags, page, version, _ = struct.unpack_from('<10I', data, 8)
++        if data[:8] != b'ANDROID!' or second_size or version != image['header_version'] or page != image['pagesize']:
++            raise Error('boot image header does not match the requested parameters')
++        if kernel_address != image['base'] + image['kernel_offset'] or tags != image['base'] + image['tags_offset']:
++            raise Error('boot image load addresses do not match the requested offsets')
+     kernel = data[page:page + kernel_size]
+     unpacker = zlib.decompressobj(16 + zlib.MAX_WBITS)
+     if unpacker.decompress(kernel) != combined or not unpacker.eof or unpacker.unused_data != tree:
+@@ -132,4 +142,5 @@ def verify(path, combined, tree, ramdisk_path, image):
+     if data[start:start + ramdisk_size] != Path(ramdisk_path).read_bytes():
+         raise Error('ramdisk bytes differ')
+     return {'kernel_sha256': hashlib.sha256(kernel).hexdigest(), 'ramdisk_bytes': ramdisk_size,
+-            'header_version': version, 'kernel_address': hex(kernel_address), 'tags_address': hex(tags)}
++            'header_version': version, 'kernel_address': hex(kernel_address) if kernel_address is not None else None,
++            'tags_address': hex(tags) if tags is not None else None}
+diff --git a/scripts/unixnu/payload.py b/scripts/unixnu/payload.py
+index 1bb9ad0..78bf097 100644
+--- a/scripts/unixnu/payload.py
++++ b/scripts/unixnu/payload.py
+@@ -154,8 +154,11 @@ def build(ctx, kernel=None):
+             dtb, ctx.board, unique_chip_id=seed, data=bool(data), trust=bool(trust), addon=bool(addon)))
+     else:
+         command = ['python3', ctx.tree / adt['tool'], '--output', payloads / 'kernel.macho.adt', '--dram-size', str(spec['dram_size'])]
++        if spec.get('dram_base') is not None:
++            command += ['--dram-base', str(spec['dram_base'])]
+         for key, flag in (('owned_memory_size', '--owned-memory-size'), ('root_match_volume_uuid', '--root-match-volume-uuid'),
+-                          ('chip_id', '--chip-id'), ('cpu_regs', '--cpu-regs'), ('psci_method', '--psci-method')):
++                          ('chip_id', '--chip-id'), ('cpu_regs', '--cpu-regs'), ('psci_method', '--psci-method'),
++                          ('boot_manifest_hash', '--boot-manifest-hash')):
+             if adt.get(key) is not None:
+                 command += [flag, str(adt[key])]
+         if seed:
+diff --git a/scripts/unixnu/userdata.py b/scripts/unixnu/userdata.py
+index f2651c0..ef3d505 100644
+--- a/scripts/unixnu/userdata.py
++++ b/scripts/unixnu/userdata.py
+@@ -57,7 +57,7 @@ def attach(dmg):
+ 
+ def disk_blocks(dmg, size):
+     """The raw disk of a disk image, in order: hdiutil's /dev/rdiskN on macOS, udif.py on other hosts."""
+-    if platform.system() != 'Darwin':
++    if platform.system() != 'Darwin' or udif.Image(dmg).size == size:
+         yield from udif.Image(dmg).blocks()
+         return
+     device = attach(dmg)

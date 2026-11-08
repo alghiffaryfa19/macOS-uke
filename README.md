@@ -1,70 +1,77 @@
 # macOS-uke
 
-macOS 26.5 (25F71) completo en la Xiaomi Pad 7 (`uke`, Snapdragon 7+ Gen 3 / SM7675), sobre el port [CrossDarwin/macOS-ForSheng](https://github.com/CrossDarwin/macOS-ForSheng) y [UniXNU](https://github.com/UniXNU/UniXNU).
+Full macOS 26.5 (25F71) on the Xiaomi Pad 7 (`uke`, Snapdragon 7+ Gen 3 / SM7675). It is built on [CrossDarwin/macOS-ForSheng](https://github.com/CrossDarwin/macOS-ForSheng) and [UniXNU](https://github.com/UniXNU/UniXNU), and on Allenwdk's iPadOS 27 GPU work for uke ([Allenwdk/UniXNU-uke](https://github.com/Allenwdk/UniXNU-uke)).
 
-Este repositorio recoge el trabajo en el estado del 2026-11-08. Es un trabajo de investigación sin terminar.
+This repository records the work as of 2026-11-08. It is unfinished research. **To build and install it, follow [INSTALL.md](INSTALL.md).**
 
-## Estado
+## Status
 
-Funciona en la tablet:
+Working on the tablet:
 
-- Arranque del kernel EL1 de ForSheng con 8 núcleos (PSCI e IPI).
-- Raíz completa de macOS (no la de recuperación). El volumen del sistema va sin sellar y los volúmenes Data/Preboot/VM se añaden a mano.
-- WindowServer y loginwindow estables.
-- **GPU Adreno 732 con Metal** (driver Adreno740 del kernel, plugin AdrenoMetal con el traductor metal2vulkan y Turnip). WindowServer compone por GPU (`-[MTLDevice acceleratorPort]` en el plugin), con desenfoque y transparencias.
-- **Escritorio** con la barra de menús de Finder, el Dock, el fondo, los iconos de estado, el reloj, el icono de Macintosh HD y los widgets.
-- **Caché de shaders persistente** en la ventana DRV (`ukecache` en `gpu/src/macos/UkeGpu.cpp`, método 0x7100/0x7101 del plugin y escritura FUA en NativeUfs). En el segundo arranque WindowServer acierta unos 107 de 209 pipelines.
-- Usuario `uke` con inicio de sesión automático y sin asistente de configuración.
-- Táctil Novatek NT36532 como puntero absoluto (`UkeTouchPointer`).
-- Log retenido de 512 KiB en la FAT `macoslog` (`scripts/macos-cycle.sh pull`), con volcados `UKE HANG` y `UKE PERF` del driver de la GPU.
+- The ForSheng EL1 kernel boots on all 8 cores (PSCI and IPIs).
+- The full macOS root, not the recovery one. The system volume is unsealed; the Data, Preboot and VM volumes are added by hand.
+- WindowServer and loginwindow are stable.
+- **Adreno 732 GPU with Metal**: the Adreno740 kernel driver, plus the AdrenoMetal plugin with the metal2vulkan translator and Turnip. WindowServer composites on the GPU (`-[MTLDevice acceleratorPort]` in the plugin), with blur and transparency.
+- **Desktop** with the Finder menu bar, the Dock, the wallpaper, status icons, the clock, the Macintosh HD icon and widgets.
+- **Persistent shader cache** in the DRV window: `ukecache` in `gpu/src/macos/UkeGpu.cpp`, plugin methods 0x7100/0x7101, and FUA writes in NativeUfs. On the second boot, WindowServer finds about 107 of its 209 pipelines in the cache.
+- User `uke` with automatic login and no Setup Assistant.
+- Novatek NT36532 touch as an absolute pointer (`UkeTouchPointer`).
+- A 512 KiB retained log in the `macoslog` FAT (`scripts/macos-cycle.sh pull`), with `UKE HANG` and `UKE PERF` dumps from the GPU driver.
 
-Arreglos importantes de la GPU (en `gpu/patches/`):
+Key GPU fixes (in `gpu/patches/`):
 
-- `0008`: las páginas WC recién puestas a cero se limpian e invalidan en caché. Era la causa de los cuelgues por palabras a cero en los IB.
-- `0007`: no se repiten los trabajos del proceso culpable tras una recuperación (evita el bucle de reinicios).
-- `0009`: las comprobaciones caras de los IB quedan desactivadas por defecto (`uke-gpu-ib-check`, `uke-gpu-ib-publish`).
-- `gpu/turnip/0001`: envíos de command buffer completos en Darwin.
+- `0008`: freshly zeroed write-combined pages are cleaned and invalidated in the cache. This was the cause of the hangs on zero words in the IBs.
+- `0007`: jobs of the guilty process are not replayed after a recovery, which stops the reboot loop.
+- `0009`: the expensive IB checks are off by default (`uke-gpu-ib-check`, `uke-gpu-ib-publish`).
+- `gpu/turnip/0001`: whole command buffers are submitted on Darwin.
 
-Falla todavía:
+Still broken:
 
-- El rendimiento: hay muchos timeouts de espera de fences con la GPU poco ocupada. Es lo siguiente que se investiga.
-- Triángulos sueltos en la animación al abrir ventanas. El traductor da lo mismo que Metal en el host, así que el fallo está en el dispositivo.
-- Mosaico al girar la tablet.
-- Cuelgues ocasionales en el reinicio en caliente (el arranque en frío va bien).
-- No hay batería en macOS (el driver SPMI ADC de iPadOS está pendiente de portar), ni gobernador de CPU por temperatura.
-- No hay escalado HiDPI; se usa `native-gop-scale=2`.
+- **Performance**: there are many fence-wait timeouts while the GPU is mostly idle. This is the next thing being investigated.
+- Stray triangles in the window-open animation. The translator gives the same output as Metal on the host, so the fault is on the device side.
+- A mosaic when rotating the tablet.
+- Occasional hangs on warm reboot; cold boots are fine.
+- No battery reading on macOS yet (the iPadOS SPMI ADC driver is still to be ported), and no thermal CPU governor.
+- No HiDPI scaling; `native-gop-scale=2` is used instead.
 
-## Contenido
+## Contents
 
-| Carpeta | Qué hay |
+| Path | What it holds |
 | --- | --- |
-| `scripts/` | Ciclo de pruebas (`macos-cycle.sh`: pull del log, flasheo de boot_a + vendor_boot, guardas del log), instalación del bundle de la GPU (`install-gpubundle.sh`), construcción del kernel, la imagen `vendor_boot` (`make-macos-image.sh`), el contenedor APFS completo (`fullos-volumes.sh`, `fullos-populate.sh`, `apfs-set-volume-group.py`), la configuración sin asistente (`macos-skip-setup.py`) y el flasheo de userdata compuesto al vuelo (`macos-full-root.py`) |
-| `docs/` | `MACOS-RETURN.md` (cómo montar macOS completo desde cero) y `METAL-MACOS-PLAN.md` (GPU y Metal) |
-| `gpu/` | El puerto de la GPU a macOS: preparación de fuentes, parches, código glue del kernel (`src/macos`), el plugin Metal y Turnip, la ventana DRV y el primado de la caché de shaders en el host (`hostcache/`) |
-| `touch/` | Driver de táctil para macOS (GENI SPI y Novatek), sin firmware |
-| `patches/forsheng/` | Cambios sobre macOS-ForSheng (base `ca57db7`, rama 26.5): los commits (`commits/`), los cambios sin commit (`worktree.diff`) y los ficheros nuevos (`new-files/`) |
-| `patches/unixnu/` | Cambios sobre el UniXNU que usa ForSheng y sus submódulos (ArmCpu, DarwinBoot, NativeUfs…); las bases están en `BASE.txt` |
-| `patches/uefi/` | Cambios sobre el UEFI UniXNU de la tablet (`BASE.txt`, `uefi-uke-fork.diff`) |
-| `patches/device/` | Cambio en `make-uke-adt.py` del repo de dispositivo (`--os-environment` y similares) |
+| `INSTALL.md` | Building and installing from scratch: inputs, workspace, UEFI, system image, GPU, kernel, flashing |
+| `setup-workspace.sh` | Rebuilds the development workspace: public repos at their base commits plus `patches/` |
+| `scripts/` | Test cycle (`macos-cycle.sh`: log pull, boot_a + vendor_boot flashing, log guard blocks); GPU bundle install (`install-gpubundle.sh`); UEFI `boot.img` (`make-boot-uefi.sh`); kernel build; the `vendor_boot` image (`make-macos-image.sh`); the full APFS container (`fullos-volumes.sh`, `fullos-populate.sh`, `apfs-set-volume-group.py`); no-Setup-Assistant configuration (`macos-skip-setup.py`); userdata flashing composed on the fly (`macos-full-root.py`) |
+| `docs/` | `MACOS-RETURN.md` (rebuilding full macOS on the author's tablet) and `METAL-MACOS-PLAN.md` (GPU and Metal); both in Spanish |
+| `gpu/` | The GPU port: source staging, patches, kernel glue (`src/macos`), the Metal plugin and Turnip patches, the DRV window, and host-side shader cache priming (`hostcache/`) |
+| `touch/` | The macOS touch driver (GENI SPI and Novatek), without firmware |
+| `patches/forsheng/` | Changes to macOS-ForSheng (base `ca57db7`, branch 26.5): commits, uncommitted changes and new files |
+| `patches/unixnu/`, `patches/unixnu-sheng/` | Changes to the UniXNU and UniXNU-sheng checkouts inside ForSheng and their submodules (ArmCpu, DarwinBoot, NativeUfs…) |
+| `patches/uefi*/` | The UniXNU UEFI for `boot_a`: uefi-uke (with mu_basecore), the UniXNU-uke device tree and the UniXNU core with DarwinBoot |
+| `patches/device/` | `make-uke-adt.py` and `patch-vendor-boot.py` from Allenwdk/UniXNU-uke, as used by `make-macos-image.sh` |
+| `patches/a27-*/` | The iPadOS 27 GPU baseline the macOS driver is staged from: Allenwdk/UniXNU (+ ArmCpu), Allenwdk/UniXNU-uke and Allenwdk/uefi-uke, with the author's unit settings |
+| `maint/export-patches.sh` | Maintainer tool that refreshes `patches/` from the working trees |
 
-Las rutas de los scripts son las de la máquina de desarrollo (`/Users/daniel/Desktop/Deliver/Domotica`): hay que adaptarlas.
+Each `patches/*/BASE.txt` names the public repository and the commit the patches apply to.
 
-## Lo que NO está aquí
+## What is NOT here
 
-No se publica, y cada uno tiene que conseguirlo por su cuenta:
+Not published. Everyone has to obtain these on their own (see INSTALL.md, step 0):
 
-- el firmware de la GPU (gen71100: GMU, SQE y ZAP) y el del táctil (Tianma);
-- las imágenes de Apple (IPSW, caché dyld, cryptex, KDK) y las cabeceras privadas de IOHIDFamily;
-- el identificador único del chip (`chip-id.txt`), las claves y las imágenes generadas;
-- las fuentes que `gpu/stage.py` copia de UniXNU-a27 y UniXNU-uke (se regeneran con ese script).
+- the GPU firmware (gen71100: GMU, SQE and ZAP) and the touch firmware (Tianma or CSOT), taken from your own tablet;
+- Apple software: the IPSW, dyld cache, cryptexes, the KDK and private headers;
+- your unit's unique chip ID (`chip-id.txt`), any keys, and generated images;
+- the sources `gpu/stage.py` copies from the iPadOS 27 tree (regenerate them with that script).
 
-## Lecciones importantes
+## Lessons learned
 
-- **Dock y barra de menús:** si se salta el asistente, hay que escribir también las claves de versión de `com.apple.SetupAssistant` (`LastSeenBuddyBuildVersion`, `PreviousBuildVersion`…) y `OptimizerPreviousBuild` en `loginwindow`. Sin ellas, loginwindow cree que es una actualización y espera a MiniBuddy. Ver `scripts/macos-skip-setup.py`.
-- **Cryptex sin ignition:** la caché dyld tiene que estar en `/System/Library/dyld` y las librerías sueltas del cryptex en sus rutas reales del volumen del sistema.
-- **Metal y SIP:** Metal solo carga plugins de confianza para SIP. Con `lp-sip0=0` ignora el plugin; hace falta `SIP0=0x7f`.
-- **Táctil:** compilar siempre con `UKE_TOUCH_SRC` exportado y comprobar `UkeTouchPointer` en el prelink.
+- **Dock and menu bar:** when you skip Setup Assistant, also write the `com.apple.SetupAssistant` version keys (`LastSeenBuddyBuildVersion`, `PreviousBuildVersion`…) and `OptimizerPreviousBuild` in `loginwindow`. Without them, loginwindow treats the boot as an update and waits for MiniBuddy. See `scripts/macos-skip-setup.py`.
+- **Cryptex without ignition:** the dyld cache must be in `/System/Library/dyld`, and the cryptex's loose libraries at their real paths on the system volume.
+- **Metal and SIP:** Metal only loads plugins that SIP trusts. With `lp-sip0=0` it ignores the plugin; it needs `SIP0=0x7f`.
+- **WindowServer on the GPU:** SkyLight chooses its compositor from `-[MTLDevice acceleratorPort]`. Without it, WindowServer falls back to CPU compositing even though Metal works.
+- **WC memory:** zero-filling write-combined pages through a cached alias leaves dirty lines that are written back later over GPU data. Clean and invalidate them before handing the pages out.
+- **Flashing:** always flash `boot_a` and `vendor_boot_a` together. A vendor_boot alone lands in fastboot.
+- **Touch:** always build with `UKE_TOUCH_SRC` exported, and check that `UkeTouchPointer` is in the prelink.
 
-La cuenta de prueba de la tablet es `uke` con contraseña `uke` (solo local).
+The tablet's test account is `uke`, password `uke` (local only).
 
-Los parches sobre ForSheng y UniXNU mantienen la licencia de esos proyectos.
+The patches to ForSheng, UniXNU and the other projects keep those projects' licenses.

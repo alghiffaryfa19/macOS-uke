@@ -24,7 +24,8 @@ import time
 import uuid
 
 # The Data volume made for the current image (fullos-volumes.sh writes it; 991CB5AC… was the 2026-11-02 one).
-DATA_UUID = open('/Users/daniel/Desktop/Deliver/Domotica/ipsw/macos26/fullos/data-uuid.txt').read().strip()
+D = os.environ.get('UKE_ROOT') or os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+DATA_UUID = open(D + '/ipsw/macos26/fullos/data-uuid.txt').read().strip()
 OS_BUILD, OS_VERSION = '25F71', '26.5'   # the full-OS image (System/Library/CoreServices/SystemVersion.plist)
 SKIP_ITEMS = ['Accessibility', 'AdditionalPrivacySettings', 'Appearance', 'AppleID', 'AppStore', 'Biometric',
               'Diagnostics', 'DisplayTone', 'EnableLockdownMode', 'FileVault', 'iCloudDiagnostics', 'iCloudStorage',

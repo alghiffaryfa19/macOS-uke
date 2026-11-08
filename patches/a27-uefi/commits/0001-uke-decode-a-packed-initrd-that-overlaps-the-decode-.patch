@@ -1,0 +1,64 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Daniel <daniel@Mac-mini-de-Daniel.local>
+Date: Tue, 3 Nov 2026 23:22:00 +0100
+Subject: [PATCH 1/4] uke: decode a packed initrd that overlaps the decode
+ window from a copy
+
+On this unit the ABL places the UEFI-compressed FAT at 0xB1E2F000, inside
+0xA8000000..0xB2000000, so the payload was never expanded and DarwinBoot
+found no initrd volume (mem ir=0).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../UkeBootMemoryDxe/UkeBootMemoryDxe.c       | 25 ++++++++++++++++---
+ 1 file changed, 21 insertions(+), 4 deletions(-)
+
+diff --git a/Platforms/Xiaomi/ukePkg/Drivers/UkeBootMemoryDxe/UkeBootMemoryDxe.c b/Platforms/Xiaomi/ukePkg/Drivers/UkeBootMemoryDxe/UkeBootMemoryDxe.c
+index ffc442dc..03a0599b 100644
+--- a/Platforms/Xiaomi/ukePkg/Drivers/UkeBootMemoryDxe/UkeBootMemoryDxe.c
++++ b/Platforms/Xiaomi/ukePkg/Drivers/UkeBootMemoryDxe/UkeBootMemoryDxe.c
+@@ -460,6 +460,8 @@ PublishInitrd (
+     UINT32 ExpandedSize = 0;
+     UINT32 ScratchSize = 0;
+     VOID *Scratch;
++    VOID *Source = (VOID *)(UINTN)Start;
++    VOID *Copy = NULL;
+     RETURN_STATUS Result;
+     CONST UINT64 Destination = 0xA8000000ULL;
+     CONST UINT64 Capacity = 0x0A000000ULL; // 160 MiB, ends at 0xB2000000
+@@ -469,16 +471,31 @@ PublishInitrd (
+     Result = UefiDecompressGetInfo ((VOID *)(UINTN)Start, PackedSize + 8,
+                                    &ExpandedSize, &ScratchSize);
+     if (RETURN_ERROR (Result) || ExpandedSize != Capacity ||
+-        Start < Destination + Capacity ||
+-        (FdtStart < Destination + Capacity && FdtEnd > Destination)) { return; }
++        (FdtStart < Destination + Capacity && FdtEnd > Destination)) {
++      DEBUG ((DEBUG_ERROR, "UKEMEM: compressed initrd rejected (%r, %u bytes)\n", Result, ExpandedSize));
++      return;
++    }
+     Status = gDS->GetMemorySpaceDescriptor (Destination, &Descriptor);
+     if (EFI_ERROR (Status) || Descriptor.GcdMemoryType != EfiGcdMemoryTypeReserved ||
+         Destination < Descriptor.BaseAddress ||
+         Destination + Capacity > Descriptor.BaseAddress + Descriptor.Length) { return; }
++    // The ABL may place the packed FAT inside the decode window (on this unit it starts at 0xB1E2F000):
++    // decode from a copy so the output never overwrites input that has not been read yet.
++    if (Start < Destination + Capacity) {
++      Copy = AllocatePool (PackedSize + 8);
++      if (Copy == NULL) { return; }
++      CopyMem (Copy, (VOID *)(UINTN)Start, PackedSize + 8);
++      Source = Copy;
++      DEBUG ((DEBUG_ERROR, "UKEMEM: packed initrd 0x%lx overlaps the decode window, decoding a copy\n", Start));
++    }
+     Scratch = AllocatePool (ScratchSize);
+-    if (Scratch == NULL) { return; }
+-    Result = UefiDecompress ((VOID *)(UINTN)Start, (VOID *)(UINTN)Destination, Scratch);
++    if (Scratch == NULL) {
++      if (Copy != NULL) { FreePool (Copy); }
++      return;
++    }
++    Result = UefiDecompress (Source, (VOID *)(UINTN)Destination, Scratch);
+     FreePool (Scratch);
++    if (Copy != NULL) { FreePool (Copy); }
+     if (RETURN_ERROR (Result) ||
+         ((UINT8 *)(UINTN)Destination)[510] != 0x55 ||
+         ((UINT8 *)(UINTN)Destination)[511] != 0xAA) { return; }

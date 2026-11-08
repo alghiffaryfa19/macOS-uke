@@ -3,7 +3,7 @@
 # (a function that crashes the translator) is started again: PrimeShaders.h moves the function it was compiling to prime-bad and resumes.
 # usage: run-prime.sh <system volume mount> [list] [cache dir]
 set -uo pipefail
-D=/Users/daniel/Desktop/Deliver/Domotica; W=$D/boot/macos-gpu/hostcache; B=$D/boot/out/drv-stage/NativeAdrenoMetal.bundle/Contents/MacOS
+D=${UKE_ROOT:-$(cd "$(dirname "$0")/../../.." && pwd)}; W=$D/boot/macos-gpu/hostcache; B=$D/boot/out/drv-stage/NativeAdrenoMetal.bundle/Contents/MacOS
 M=${1:?mount}; L=${2:-$W/out/metallibs.txt}; C=${3:-$W/cache-25f71}
 [ -f "$L" ] || find "$M/System/Library" -name '*.metallib' -type f | sort > "$L"
 for attempt in $(seq 1 40); do

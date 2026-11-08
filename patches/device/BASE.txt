@@ -1,1 +1,1 @@
-UniXNU-uke-kbuild-ios26 branch ios26 d33da99cdf6a155a598ccb2249fc2a3a26627563 (based on Allenwdk/UniXNU-uke)
+https://github.com/Allenwdk/UniXNU-uke.git 783bad5ad5600591fa7edc77ffd578234e69323e

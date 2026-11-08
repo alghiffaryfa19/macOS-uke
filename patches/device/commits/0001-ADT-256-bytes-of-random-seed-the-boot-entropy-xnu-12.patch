@@ -1,0 +1,24 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Daniel <daniel@Mac-mini-de-Daniel.local>
+Date: Sun, 1 Nov 2026 09:36:07 +0100
+Subject: [PATCH 1/2] ADT: 256 bytes of random-seed, the boot entropy xnu-12377
+ asks for (4 x SHA-512); as hakios-arm64e-dada
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ scripts/make-uke-adt.py | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/scripts/make-uke-adt.py b/scripts/make-uke-adt.py
+index 599ac84..062dfeb 100755
+--- a/scripts/make-uke-adt.py
++++ b/scripts/make-uke-adt.py
+@@ -157,7 +157,7 @@ def main():
+         ('#address-cells', struct.pack('<I', 2)),
+         ('#size-cells', struct.pack('<I', 2)),
+     ], [
+-        node('chosen', [('random-seed', os.urandom(64)),
++        node('chosen', [('random-seed', os.urandom(256)),
+                         # Without these XNU never publishes IOPlatformUUID and gethostuuid() blocks forever
+                         # for callers (configd) that pass a zero timeout.
+                         *([('unique-chip-id', struct.pack('<Q', args.unique_chip_id)), ('chip-id', struct.pack('<I', args.chip_id))]

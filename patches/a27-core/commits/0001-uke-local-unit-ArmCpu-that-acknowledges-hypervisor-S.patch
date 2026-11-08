@@ -1,0 +1,18 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Daniel <daniel@Mac-mini-de-Daniel.local>
+Date: Tue, 3 Nov 2026 23:53:13 +0100
+Subject: [PATCH] uke (local unit): ArmCpu that acknowledges hypervisor
+ SGIs/PPIs
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ drivers/ArmCpu | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/ArmCpu b/drivers/ArmCpu
+index 93a5030..f0aa510 160000
+--- a/drivers/ArmCpu
++++ b/drivers/ArmCpu
+@@ -1 +1 @@
+-Subproject commit 93a5030c5d983d0ef90f0fca93879d6e36ad1ba8
++Subproject commit f0aa5102230c8eca668597f53fa90fe178b791f3

@@ -10,7 +10,7 @@
 # Volumes are found by UUID/role inside the container of THIS image only, never by name.
 # Usage: sudo boot/fullos-populate.sh
 set -euo pipefail
-D=/Users/daniel/Desktop/Deliver/Domotica
+D=${UKE_ROOT:-$(cd "$(dirname "$0")/.." && pwd)}
 F=$D/ipsw/macos26/fullos
 IMG=$F/25F71__MacOS/094-56453-087.dmg
 CX=$F/25F71__MacOS/094-56679-089.dmg
