@@ -1,0 +1,60 @@
+--- a/RootTransportLayout.h	2026-11-07 23:28:36
++++ b/RootTransportLayout.h	2026-11-07 23:28:36
+@@ -4,6 +4,10 @@
+   kRspOffset = 512,
+   kPrdtOffset = 1024,
+   kDataOffset = 8192,
+-  kDataMax = 131072,
++  // uke (2026-11-07): 512 KiB a command (Linux ufshcd's default max_sectors 1024), as two PRDT entries of 256 KiB (the UFSHCI
++  // data byte count is 18 bits). Was 128 KiB in one entry.
++  kDataMax = 524288,
++  kPrdtEntryMax = 262144,
++  kPrdtEntries = kDataMax / kPrdtEntryMax,
+   kDmaBytes = kDataOffset + kDataMax,
+ };
+--- a/RootCommands.h	2026-11-07 23:28:36
++++ b/RootCommands.h	2026-11-07 23:28:36
+@@ -66,14 +66,17 @@
+   words[4] = static_cast<uint32_t> (ucdPhys);
+   words[5] = static_cast<uint32_t> (ucdPhys >> 32);
+   words[6] = (512U >> 2) | ((kRspOffset >> 2) << 16);
+-  words[7] = (dataBytes ? 1U : 0U) | ((kPrdtOffset >> 2) << 16);
+-  if (dataBytes) {
+-    uint64_t dataPhys = gHost.phys + kDataOffset;
+-    uint32_t *prd = reinterpret_cast<uint32_t *> (gHost.virt + kUcdOffset + kPrdtOffset);
++  const uint32_t entries = (dataBytes + kPrdtEntryMax - 1) / kPrdtEntryMax;
++  words[7] = entries | ((kPrdtOffset >> 2) << 16);
++  for (uint32_t entry = 0; entry < entries; entry++) {
++    uint64_t dataPhys = gHost.phys + kDataOffset + uint64_t (entry) * kPrdtEntryMax;
++    uint32_t bytes = dataBytes - entry * kPrdtEntryMax;
++    if (bytes > kPrdtEntryMax) bytes = kPrdtEntryMax;
++    uint32_t *prd = reinterpret_cast<uint32_t *> (gHost.virt + kUcdOffset + kPrdtOffset) + entry * 4;
+     prd[0] = static_cast<uint32_t> (dataPhys);
+     prd[1] = static_cast<uint32_t> (dataPhys >> 32);
+     prd[2] = 0;
+-    prd[3] = dataBytes - 1;
++    prd[3] = bytes - 1;
+   }
+   cacheCivac (gHost.virt, kDataOffset + dataBytes);
+   hostWrite (0x20, 1);  // Acknowledge completion only; preserve error evidence.
+@@ -115,7 +118,7 @@
+     return false;
+   }
+   uint32_t *words = reinterpret_cast<uint32_t *> (gHost.virt + kUcdOffset);
+-  for (unsigned index = 0; index < (kPrdtOffset + 16) / 4; index++) {
++  for (unsigned index = 0; index < (kPrdtOffset + 16 * kPrdtEntries) / 4; index++) {
+     words[index] = 0;
+   }
+   return true;
+--- a/RootLayout.h	2026-11-07 23:31:58
++++ b/RootLayout.h	2026-11-07 23:31:58
+@@ -22,7 +22,8 @@
+   uint32_t ext4Blocks;                    // s_blocks_count_lo at byte 1028
+ };
+ 
+-static uint8_t gScratch[kDataMax];
++// uke: 128 KiB (its largest read is 16 KiB of GPT entries); kDataMax grew to 512 KiB and the boot FAT has no room for a bigger zero-fill.
++static uint8_t gScratch[131072];
+ 
+ static uint32_t le32 (const uint8_t *at)
+ {

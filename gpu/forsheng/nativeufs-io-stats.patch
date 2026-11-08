@@ -1,0 +1,46 @@
+--- a/NativeUfs.cpp	2026-11-07 23:21:12
++++ b/NativeUfs.cpp	2026-11-07 23:21:12
+@@ -1405,6 +1405,9 @@
+ 
+ // Transport read timing is independent of the optional VerifiedBlock policy.
+ volatile uint64_t native_ufs_read_ticks = 0;
++// uke: block requests the system makes (all windows): [0..2] reads, bytes, ticks (lock wait included), [3..5] writes, bytes, ticks,
++// [6..8] media reads the RAM overlay path issued (commands, bytes, ticks), [9] longest read request in ticks. Ticks are CNTPCT (19.2 MHz).
++extern "C" {volatile uint64_t uke_ufs_io[10];}
+ static inline uint64_t timerTicks (void) {uint64_t v; __asm__ volatile ("isb\n\tmrs %0, cntpct_el0" : "=r" (v)); return v;}
+ 
+ #if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
+@@ -1606,6 +1609,7 @@
+   }
+   bool write = buffer->getDirection () == kIODirectionOut;
+   if (buffer->getDirection () != kIODirectionIn && !write) return kIOReturnBadArgument;
++  const uint64_t ukeBegan = timerTicks ();
+   if (write && !overlay.pages) return kIOReturnNotWritable;
+   if (!online) {
+     return kIOReturnNotReady;
+@@ -1676,7 +1680,12 @@
+         return page;
+       }
+       void release (uint8_t *) {}   // a page from a slab is kept; release only follows a failed seed read
+-      IOReturn read (uint64_t lba, uint32_t blocks, void *out) { return hostRead4k (0, lba, blocks, out); }
++      IOReturn read (uint64_t lba, uint32_t blocks, void *out) {
++        const uint64_t t0 = timerTicks ();
++        IOReturn r = hostRead4k (0, lba, blocks, out);
++        uke_ufs_io[6] = uke_ufs_io[6] + 1; uke_ufs_io[7] = uke_ufs_io[7] + blocks * 4096ULL; uke_ufs_io[8] = uke_ufs_io[8] + (timerTicks () - t0);
++        return r;
++      }
+       uint64_t load (uint64_t offset, void *out, uint64_t length) { return buffer->readBytes (offset, out, length); }
+       uint64_t copy (uint64_t offset, const void *data, uint64_t length) { return buffer->writeBytes (offset, data, length); }
+     } overlayOps = { windowLock, buffer, ukeSlab, ukeSlabUsed };
+@@ -1695,6 +1704,11 @@
+     gRootDiagnostic.result = static_cast<uint32_t> (result);
+     rootDiagnosticFailure (write ? "ISC volatile overlay write failed" : "root window read failed");
+   }
++  {
++    const uint64_t took = timerTicks () - ukeBegan, k = write ? 3 : 0;
++    uke_ufs_io[k] = uke_ufs_io[k] + 1; uke_ufs_io[k + 1] = uke_ufs_io[k + 1] + count * 512; uke_ufs_io[k + 2] = uke_ufs_io[k + 2] + took;
++    if (!write && took > uke_ufs_io[9]) uke_ufs_io[9] = took;
++  }
+   completion->action (completion->target, completion->parameter, result, done);
+   return kIOReturnSuccess;
+ }

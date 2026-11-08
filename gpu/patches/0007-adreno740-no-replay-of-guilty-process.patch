@@ -1,0 +1,36 @@
+--- a/drivers/Adreno740/NativeAdrenoSubmit.cpp
++++ b/drivers/Adreno740/NativeAdrenoSubmit.cpp
+@@ -39,6 +39,8 @@
+  * address as native_adreno_stall_mem holds the others. */
+ /* uke: IB ranges written back before submission: [0] ranges, [1] bytes, [2] the last failure. */
+ extern "C" {volatile uint32_t native_uke_ib_publish[3];}
++/* uke: queued jobs of a hang's guilty process turned into a CP_NOP by the restart instead of replayed. */
++extern "C" {volatile uint32_t native_uke_replay_skipped;}
+ /* uke: each IB's first word as the GPU reads it from DRAM, before the submission's cache maintenance and after: [0] IBs checked, [1] zero
+  * before, [2] zero before and not after (it was in a CPU cache), [3] still zero after (the pages the GPU maps never got it), [4] BO kind
+  * (NativeAdrenoVm::kindAt) of the first [2] case, [5] its pid, [6] its iova (lo), [7] kind of the first [3] case, [8] its pid, [9] its iova
+@@ -917,9 +919,13 @@
+     const uint32_t hung=fence<last?fence+1:fence;
+     Job *guilty=(!stranded && fence<last)?find(hung):nullptr;
+     out->fence=hung;
++    /* uke: the guilty process's queued jobs are not replayed (their command streams hit the same trap: log M30 restarted the GPU once a
++     * second for 7 s, replaying 5, 5, 4, 3, 2, 1 of iconservicesagent's jobs); like msm, only other contexts' work runs again. */
++    NativeAdrenoVm *guilty_vm=nullptr;
+     if(guilty) {
+         NativeAdrenoVm *vm=guilty->vm?guilty->vm:vm_;
+         vm->noteHang(vm!=vm_);out->guilty=vm;
++        if(vm!=vm_)guilty_vm=vm;
+     }
+     /* A hang inside a second-ring job is blamed on the second ring: it is given up (reason 4), the replay and everything after run on the first. */
+     if(guilty && guilty->ring==1)markPreemptDead(4);
+@@ -954,7 +960,9 @@
+     for(uint32_t next=hung+1;next && next<=last;++next) {
+         Job *job=find(next);
+         NativeAdrenoVm *vm=job && job->vm?job->vm:vm_;
+-        const bool run=job && !vm->unusable() && job->word_count;
++        const bool skipped=job && guilty_vm && vm==guilty_vm;
++        if(skipped)native_uke_replay_skipped=native_uke_replay_skipped+1;
++        const bool run=job && !vm->unusable() && job->word_count && !skipped;
+         status=useVm(vm,clock);
+         if(status) {native_adreno_recover_trace[0]=5;native_adreno_recover_trace[1]=uint32_t(status);return poison();}
+         ring(0)->useContext(job?job->context:0);

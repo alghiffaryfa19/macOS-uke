@@ -1,0 +1,149 @@
+--- a/drivers/Adreno740/NativeAdrenoSmmuMemory.h
++++ b/drivers/Adreno740/NativeAdrenoSmmuMemory.h
+@@ -31,6 +31,8 @@
+     size_t pageCount() const {return count_;}
+     uint64_t pagePhysical(size_t i) const {return i<count_?pages_[i].physical:0;}
+     const volatile uint64_t *pageMapping(size_t i) const {return i<count_?pages_[i].mapping:nullptr;}
++    /* The CPU mapping of the table page at physical (diagnostic walks); null when it is not one of these pages. */
++    const volatile uint64_t *mappingOf(uint64_t physical) const {return findPage(const_cast<NativeAdrenoTablePages *>(this),physical);}
+     void quarantine() {quarantined_=true;}
+     bool quarantined() const {return quarantined_;}
+     /* Frees every page, only once no walk can reach them (the ASID invalidated, the table not installed). Refused when quarantined. */
+--- a/drivers/Adreno740/NativeAdrenoVm.h
++++ b/drivers/Adreno740/NativeAdrenoVm.h
+@@ -147,6 +147,9 @@
+     IOReturn peekWordsUncached(uint64_t iova,uint32_t *out,size_t count) const;
+     /* The physical address of the leaf descriptor that maps the page at target (the table walk coherence proof); false when none does. */
+     bool leafPhysical(uint64_t target,uint64_t *physical) const;
++    /* Diagnostic walk of the lower region's tables (the CPU's view of them) for iova: the physical address the GPU translates it to (0 when
++     * no valid leaf maps it) and the last descriptor read, *level the level it was read at. */
++    uint64_t walkDiag(uint64_t iova,uint64_t *descriptor,unsigned *level) const;
+     /* The context bank's fault record for the board log: FSR, FAR (lo, hi) and FSYNR0. Reads only; never clears a fault. */
+     IOReturn faultState(uint32_t out[4]) const;
+     /* Map handles count up and are never reused, so they order mappings in time: the next one, and the one over a GPU address (0: none). */
+--- a/drivers/Adreno740/NativeAdrenoVm.cpp
++++ b/drivers/Adreno740/NativeAdrenoVm.cpp
+@@ -570,6 +570,24 @@
+         return peekWords(iova,out,count);
+     }
+     return kIOReturnBadArgument;
++}
++uint64_t NativeAdrenoVm::walkDiag(uint64_t iova,uint64_t *descriptor,unsigned *level) const
++{
++    *descriptor=0;*level=0xff;
++    const NativeAdrenoVmRegion &r=regions_[0];
++    if(!attached_ || !r.state || !r.tables)return 0;
++    const uint64_t out=UINT64_C(0x0000fffffffff000);
++    uint64_t table=r.state->tables.root_physical;
++    for(unsigned l=r.state->tables.start_level;l<=3;++l) {
++        const volatile uint64_t *words=r.tables->mappingOf(table);
++        if(!words)return 0;
++        const uint64_t d=words[(iova>>(12+9*(3-l)))&511];
++        *descriptor=d;*level=l;
++        if((d&3)!=3)return 0;   /* invalid, or a block (never used: only 4 KiB leaves) */
++        if(l==3)return (d&out)|(iova&4095);
++        table=d&out;
++    }
++    return 0;
+ }
+ bool NativeAdrenoVm::leafPhysical(uint64_t target,uint64_t *physical) const
+ {
+--- a/drivers/Adreno740/NativeAdrenoSubmit.cpp
++++ b/drivers/Adreno740/NativeAdrenoSubmit.cpp
+@@ -31,6 +31,17 @@
+  * The last 4: the map handle that was next when the stalled job was submitted, then the handles of the mappings under the BR IB1, the BV IB1
+  * and the BV IB2 (0: unmapped). A handle at or above the first was mapped after the submission: its memory was freed and reused under the GPU. */
+ extern "C" {volatile uint32_t native_adreno_stall[2+NativeAdrenoRingStallWords];volatile uint32_t native_adreno_stall_mem[4+3*17+4];}
++/* uke: the stalled job and what its address space says about the words BR stopped on (same moment as native_adreno_stall): [0] its fence,
++ * [1] the submitting pid, [2] ring, [3] ring context, [4] IB count, [5] its VM's ASID, [6] 1 when its VM is the table the GPU runs after
++ * the queued work, [7] ms since its submission; then for the BR IB1 fetch address and the BR IB2 fetch address each: the address (lo, hi),
++ * the leaf descriptor (lo, hi), the level it was read at, the physical address it translates to (lo, hi) [8..14], [15..21]; [22] the
++ * ring table the ring installs last (lo of TTBR0), [23] ASID of that table. native_adreno_stall_ib2 holds 17 words at the BR IB2 fetch
++ * address as native_adreno_stall_mem holds the others. */
++extern "C" {volatile uint32_t native_adreno_stall_job[24];volatile uint32_t native_adreno_stall_ib2[17];}
++/* Also at the snapshot: [0] the first ring index, then 48 ring words from 32 before the read pointer; each thread's SQE PC and packet
++ * (BR pc, BR packet, BV pc, BV packet); and the BR IB1 window of native_adreno_stall_mem read as the GPU translates it: [0] its first
++ * dword index, then 16 words from DRAM at the physical addresses the job's tables give (0xdeadbeef: no valid leaf, 0xdeadbee1: no DRAM read). */
++extern "C" {volatile uint32_t native_adreno_stall_ring[1+48];volatile uint32_t native_adreno_stall_sqe[4];volatile uint32_t native_adreno_stall_gpuview[1+16];}
+ /* 16 words of the IB at start, from 12 dwords before the dword the thread has reached (size minus what remains). */
+ static void peekIb(const NativeAdrenoVm *vm,uint64_t start,uint32_t size,uint32_t remaining,volatile uint32_t *slot)
+ {
+@@ -646,6 +657,45 @@
+         native_adreno_stall_mem[56]=(uint32_t)space->handleAt(brIb);
+         native_adreno_stall_mem[57]=(uint32_t)space->handleAt(bvIb);
+         native_adreno_stall_mem[58]=(uint32_t)space->handleAt((uint64_t)words[21]<<32|words[20]);
++    }
++    {
++        volatile uint32_t *s=native_adreno_stall_job;
++        for(unsigned i=0;i<24;++i)s[i]=0;
++        s[0]=next;
++        if(job) {
++            s[1]=(uint32_t)job->owner;s[2]=job->ring;s[3]=job->context;s[4]=(uint32_t)job->count;
++            s[5]=job->vm?job->vm->asid():0;s[6]=job->vm && job->vm==table_vm_;
++            s[7]=job->submit_us && now>job->submit_us?(uint32_t)((now-job->submit_us)/1000):0;
++        }
++        const uint64_t fetch[2]={(uint64_t)words[11]<<32|words[10],(uint64_t)words[14]<<32|words[13]};
++        for(unsigned f=0;f<2;++f) {
++            uint64_t d=0;unsigned level=0xff;
++            const uint64_t pa=space->walkDiag(fetch[f],&d,&level);
++            volatile uint32_t *o=&s[8+7*f];
++            o[0]=(uint32_t)fetch[f];o[1]=(uint32_t)(fetch[f]>>32);o[2]=(uint32_t)d;o[3]=(uint32_t)(d>>32);o[4]=level;
++            o[5]=(uint32_t)pa;o[6]=(uint32_t)(pa>>32);
++        }
++        const uint64_t table=stalled->table();
++        s[22]=(uint32_t)table;s[23]=(uint32_t)(table>>48);
++        peekFetch(space,fetch[1],native_adreno_stall_ib2);
++        uint32_t ringWords[48]={},sqe[4]={};
++        const uint32_t first=(words[8]-32)&0xffffu;
++        stalled->peekRing(first,ringWords,48);
++        native_adreno_stall_ring[0]=first;
++        for(unsigned i=0;i<48;++i)native_adreno_stall_ring[1+i]=ringWords[i];
++        if(!stalled->sqeState(sqe))for(unsigned i=0;i<4;++i)native_adreno_stall_sqe[i]=sqe[i];
++        uint64_t ib1=0;uint32_t ib1Size=0;
++        native_adreno_stall_gpuview[0]=0xffffffffu;
++        if(!stalled->ibBefore(words[8],&ib1,&ib1Size)) {
++            const uint32_t at=native_adreno_stall_mem[4];   /* the window peekIb read */
++            native_adreno_stall_gpuview[0]=at;
++            for(unsigned i=0;i<16;++i) {
++                uint64_t d=0;unsigned level=0;uint32_t value=0xdeadbeefu;
++                const uint64_t pa=space->walkDiag(ib1+4ull*(at+i),&d,&level);
++                if(pa)value=native_adreno_dram_read32 && !native_adreno_dram_read32(pa,&value)?value:0xdeadbee1u;
++                native_adreno_stall_gpuview[1+i]=value;
++            }
++        }
+     }
+     for(uint32_t i=0;i<NativeAdrenoRingStallWords;++i)native_adreno_stall[2+i]=words[i];
+     native_adreno_stall[1]=stall_timeouts;
+--- a/drivers/Adreno740/NativeAdrenoRing.h
++++ b/drivers/Adreno740/NativeAdrenoRing.h
+@@ -201,6 +201,9 @@
+      * CP_IB1_REM_SIZE, CP_IB2_BASE (lo, hi), CP_IB2_REM_SIZE, CP_BV_RB_RPTR, CP_BV_IB1_BASE lo, CP_BV_IB1_REM_SIZE,
+      * CP_BV_IB2_REM_SIZE. Never writes a register; a failed read is poison. */
+     IOReturn stallState(uint32_t *out);
++    /* uke diagnostics: n ring words from index at (wrapping), and each CP thread's SQE PC and current packet header (BR, then BV). */
++    void peekRing(uint32_t at,uint32_t *out,unsigned n) const;
++    IOReturn sqeState(uint32_t out[4]);
+     /* Writes CP_RB_WPTR again with the value already published: for a CP that went idle with work in the ring (a lost write pointer
+      * notification); harmless when the CP already saw it. */
+     IOReturn kick();
+--- a/drivers/Adreno740/NativeAdrenoRing.cpp
++++ b/drivers/Adreno740/NativeAdrenoRing.cpp
+@@ -163,6 +163,18 @@
+     if(!out)return kIOReturnBadArgument;
+     for(uint32_t i=0;i<NativeAdrenoRingStallWords;++i)
+         if(io_.read32(io_.cookie,regs[i],&out[i]))return poison();
++    return kIOReturnSuccess;
++}
++void NativeAdrenoRing::peekRing(uint32_t at,uint32_t *out,unsigned n) const
++{
++    const uint32_t mask=(uint32_t)(ring_bytes_/4-1);
++    for(unsigned i=0;i<n;++i)out[i]=ring_?ring_[(at+i)&mask]:0;
++}
++IOReturn NativeAdrenoRing::sqeState(uint32_t out[4])
++{
++    /* CP_SQE_STAT_ADDR/DATA (0x908/0x909) and the BV pair (0xa87/0xa88): index 0 is the PC, the next read the current packet (crashdec). */
++    if(io_.write32(io_.cookie,0x0908,0) || io_.read32(io_.cookie,0x0909,&out[0]) || io_.read32(io_.cookie,0x0909,&out[1]))return kIOReturnIOError;
++    if(io_.write32(io_.cookie,0x0a87,0) || io_.read32(io_.cookie,0x0a88,&out[2]) || io_.read32(io_.cookie,0x0a88,&out[3]))return kIOReturnIOError;
+     return kIOReturnSuccess;
+ }
+ IOReturn NativeAdrenoRing::kick()

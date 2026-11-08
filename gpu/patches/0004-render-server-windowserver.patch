@@ -1,0 +1,40 @@
+--- a/drivers/Adreno740/NativeAdrenoPublish.cpp
++++ b/drivers/Adreno740/NativeAdrenoPublish.cpp
+@@ -11,6 +11,10 @@
+  * The connection class is named AGXDeviceUserClient on purpose: the original sandbox profiles of the processes that use Metal
+  * allow IOServiceOpen for that user-client class name, and nothing else in this system can create one (the Apple AGX kext is
+  * never loaded without an Apple GPU), so the name only decides whether the Adreno Metal plugin may open its own driver. */
++/* uke macOS 26.5: the render server is WindowServer, not iPadOS backboardd (slot 0, mailbox, cache export, text rows). */
++#ifndef UKE_RENDER_SERVER_NAME
++#define UKE_RENDER_SERVER_NAME "WindowServer"
++#endif
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOMemoryDescriptor.h>
+ #include <IOKit/IOBufferMemoryDescriptor.h>
+@@ -334,7 +338,7 @@
+     if(!core)return false;
+     IOLockLock(g.lock);
+     bool ok=false;
+-    const bool server=!kernel && !strncmp(name_,"backboardd",sizeof name_);
++    const bool server=!kernel && !strncmp(name_,UKE_RENDER_SERVER_NAME,sizeof name_);
+     NativeAdrenoProcessVm *space=nullptr;
+     IOReturn opened=kIOReturnSuccess;
+     if(kernel)opened=g.kernel_client?kIOReturnBusy:kIOReturnSuccess;
+@@ -755,7 +759,7 @@
+         Piece piece{};
+         if(input && input_size>=sizeof(piece))memcpy(&piece,input,sizeof(piece));
+         const bool valid=!output_size && input && input_size>=sizeof(piece) && piece.bytes && piece.bytes<=NativeAdrenoExportMaxPiece &&
+-            input_size==sizeof(piece)+piece.bytes && !strncmp(caller,"backboardd",sizeof caller);
++            input_size==sizeof(piece)+piece.bytes && !strncmp(caller,UKE_RENDER_SERVER_NAME,sizeof caller);
+         const int stored=valid && boot_log_export_put?boot_log_export_put(piece.generation,piece.total,piece.offset,
+             static_cast<const uint8_t *>(input)+sizeof(piece),piece.bytes):-1;
+         if(stored) {native_adreno_export_stats[1]=native_adreno_export_stats[1]+1;return kIOReturnBadArgument;}
+@@ -929,7 +933,7 @@
+                  * rewrites report2 every ten seconds, so the reason another process's device failed would be gone from it. */
+                 char who[20]={};
+                 proc_selfname(who,sizeof who);
+-                if(value==0x7fff && strncmp(who,"backboardd",sizeof who)) {
++                if(value==0x7fff && strncmp(who,UKE_RENDER_SERVER_NAME,sizeof who)) {
+                     for(auto &entry:native_adreno_client_text) {
+                         if(!entry.name[0]) strlcpy(entry.name,who,sizeof entry.name);
+                         if(!strncmp(entry.name,who,sizeof entry.name)) {line=entry.text;break;}

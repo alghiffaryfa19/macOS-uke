@@ -53,7 +53,8 @@ def sources(src):
         items += [src / 'kits' / kit / name for name in names]
     items += sorted((src / 'kits/ArmSmmu4K').glob('ArmSmmu4K*.c'))
     items += sorted(p for p in (src / 'drivers/Adreno740').glob('NativeAdreno*.cpp') if p.name not in EXCLUDED)
-    items += [src / 'package/GpuPowerProbe.cpp', src / 'macos/UkeGpu.cpp', src / 'macos/UkeGpuAccelerator.cpp']
+    items += [src / 'package/GpuPowerProbe.cpp', src / 'macos/UkeGpu.cpp', src / 'macos/UkeGpuAccelerator.cpp',
+              src / 'macos/UkeGopHandoff.cpp', src / 'macos/UkeCpuFreq.cpp']
     return items
 
 
@@ -197,9 +198,10 @@ def main():
     # (The selected Apple kexts also export symbols; the GPU objects import none of theirs.)
     kernel = set(subprocess.run(['xcrun', 'nm', '-gUj', str(XNU / 'kernel.development.sheng')],
                                 capture_output=True, text=True).stdout.split())
-    provided = set(BUNDLE_PROVIDED)
+    provided = set(BUNDLE_PROVIDED) | {'_uke_ufs_io', '_uke_persist', '_uke_ufs_slots'}   # NativeUfs request statistics (forsheng/nativeufs-io-stats.patch)
     if firmware_mode() == 'drv':
         provided.add('_native_ufs_drv_read')   # the NativeUfs DRV patch
+        provided.add('_native_ufs_drv_write')   # forsheng/nativeufs-drv-cache-write.patch
     missing = sorted(set(undefined) - kernel - provided)
     listing = subprocess.run(['xcrun', 'nm', '-m', '-u', str(binary)], capture_output=True, text=True).stdout
     weak = sorted(set(line.split()[-4] for line in listing.splitlines() if 'weak' in line) - provided)

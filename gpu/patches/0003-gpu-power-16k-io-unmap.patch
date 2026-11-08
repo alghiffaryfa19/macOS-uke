@@ -1,0 +1,48 @@
+--- a/package/GpuPowerProbe.cpp
++++ b/package/GpuPowerProbe.cpp
+@@ -451,11 +451,17 @@
+ // own cache attribute to the requested mode, which changed every mapping of the page, a client's view of its BO included (int-098).
+ extern "C" vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
+ extern "C" void ml_io_unmap(vm_offset_t addr, vm_size_t size);
++// macOS: io_map maps whole kernel pages (16 KiB) and returns the address of phys_addr inside them, but ml_io_unmap
++// does not round (pmap_remove panics "invalid address range" on a 4 KiB range): unmap the whole pages it mapped.
++static void ioUnmap(vm_offset_t va, vm_size_t size) {
++    const vm_offset_t base = va & ~vm_offset_t(page_size - 1);
++    ml_io_unmap(base, (va - base + size + page_size - 1) & ~vm_size_t(page_size - 1));
++}
+ bool physRead64(uint64_t pa, uint64_t *out) {
+     const vm_offset_t va = ml_io_map_unmappable(vm_offset_t(pa & ~uint64_t(0xfff)), 0x1000, 0x7 /* VM_WIMG_IO */);
+     if (!va) return false;
+     *out = *reinterpret_cast<volatile uint64_t *>(va + (pa & 0xff8));
+-    ml_io_unmap(va, 0x1000);
++    ioUnmap(va, 0x1000);
+     return true;
+ }
+ // NativeAdrenoVm::sampleWord's cached reader: one aligned word through the kernel's cacheable physical aperture, so a line a client's
+@@ -482,7 +488,7 @@
+     const uint64_t began = mach_absolute_time();
+     const vm_offset_t page = ml_io_map_unmappable(vm_offset_t(pa & ~uint64_t(0xfff)), 0x1000, 0x7 /* VM_WIMG_IO */);
+     const vm_offset_t cached = phystokv(pa);
+-    if (!page || !cached) {if (page) ml_io_unmap(page, 0x1000); return 1;}
++    if (!page || !cached) {if (page) ioUnmap(page, 0x1000); return 1;}
+     const vm_offset_t dram = page + vm_offset_t(pa & 0xfff);
+     for (size_t at = 0; at < bytes; at += 64) {
+         const volatile uint64_t *c = reinterpret_cast<const volatile uint64_t *>(cached + at);
+@@ -501,7 +507,7 @@
+             ++*stale;
+         }
+     }
+-    ml_io_unmap(page, 0x1000);
++    ioUnmap(page, 0x1000);
+     native_adreno_audit_ticks += mach_absolute_time() - began;
+     return 0;
+ }
+@@ -1138,7 +1144,7 @@
+     const vm_offset_t page = ml_io_map_unmappable(vm_offset_t(pa), 0x1000, 0x7 /* VM_WIMG_IO */);
+     if (!page) return false;
+     for (unsigned i = 0; i < 1024; ++i) out[i] = reinterpret_cast<const volatile uint32_t *>(page)[i];
+-    ml_io_unmap(page, 0x1000);
++    ioUnmap(page, 0x1000);
+     return true;
+ }
+ bool gpuCopyPage(uint64_t src, uint64_t dst) {

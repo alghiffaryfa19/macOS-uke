@@ -1,0 +1,38 @@
+--- a/drivers/Adreno740/NativeAdrenoPublish.cpp
++++ b/drivers/Adreno740/NativeAdrenoPublish.cpp
+@@ -67,6 +67,11 @@
+  * Input: {generation, total, offset, bytes} then the bytes. No GPU state is touched; any connection of the render server may send it. */
+ enum : UInt32 {NativeAdrenoExportMethod=0x7100,NativeAdrenoExportMaxPiece=3968};
+ extern "C" int boot_log_export_put(uint32_t generation,uint32_t total,uint32_t offset,const void *data,uint32_t size) __attribute__((weak_import));
++/* uke macOS: the persistent pipeline cache's newest export, read back by the render server's plugin before its device opens
++ * (macos/UkeGpu.cpp). Method 0x7101, input {offset, bytes}: bytes 0 answers {total, 0} (8 bytes), else exactly `bytes` (at most
++ * NativeAdrenoExportMaxPiece) of the export from `offset`. */
++enum : UInt32 {NativeAdrenoCacheReadMethod=0x7101};
++extern "C" int uke_cache_read(uint32_t offset,void *out,uint32_t size,uint32_t *total);
+ extern "C" {volatile uint32_t native_adreno_export_stats[4];}   /* [0] pieces taken, [1] refused, [2] last generation, [3] its total bytes */
+ extern "C" IOMemoryDescriptor *native_gop_handoff_memory(void);
+ 
+@@ -766,6 +771,23 @@
+         native_adreno_export_stats[0]=native_adreno_export_stats[0]+1;
+         native_adreno_export_stats[2]=piece.generation;native_adreno_export_stats[3]=piece.total;
+         return kIOReturnSuccess;
++    }
++    if(method==NativeAdrenoCacheReadMethod) {
++        struct Request {uint32_t offset,bytes;};
++        char caller[20]={};proc_selfname(caller,sizeof caller);
++        Request request{};
++        if(!input || input_size!=sizeof(request) || !output || strncmp(caller,UKE_RENDER_SERVER_NAME,sizeof caller))return kIOReturnBadArgument;
++        memcpy(&request,input,sizeof request);
++        uint32_t total=0;
++        if(!request.bytes) {
++            if(output_size!=8)return kIOReturnBadArgument;
++            (void)uke_cache_read(0,nullptr,0,&total);
++            const uint32_t answer[2]={total,0};
++            memcpy(output,answer,8);
++            return kIOReturnSuccess;
++        }
++        if(request.bytes>NativeAdrenoExportMaxPiece || output_size!=request.bytes)return kIOReturnBadArgument;
++        return uke_cache_read(request.offset,output,request.bytes,&total)?kIOReturnIOError:kIOReturnSuccess;
+     }
+     if(method==NativeAdrenoMethodBoCpuUnmap && input && input_size==sizeof(NativeAdrenoAbiBoCpuUnmap)) {
+         /* The view is shared by every CPU mapping of the BO, and dropViews removes all of them. A BO mapped twice (the view cache served 207

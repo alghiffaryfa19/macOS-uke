@@ -1,0 +1,73 @@
+--- a/NativeUfs.cpp
++++ b/NativeUfs.cpp
+@@ -1244,6 +1244,7 @@
+   bool configure (const char *name, uint64_t absoluteOffset, uint64_t size);
+ #if defined(NATIVE_UFS_DRV_BYTES)
+   IOReturn readRaw (uint64_t offset, void *out, uint32_t length);
++  IOReturn writeRaw (uint64_t offset, const void *in, uint32_t length);
+ #endif
+   bool start (IOService *provider) override;
+   void free () override;
+@@ -1337,6 +1338,10 @@
+   if (!strcmp (label, "DRV")) {
+     gDrvWindow = this;
+     if (bytes & 4095) return false;
++    if ((absolute & 4095) == 0 && bytes > (2ULL << 20)) {
++      gDrvWriteFirst = (absolute + (1ULL << 20)) / 4096;
++      gDrvWriteBlocks = (bytes - (2ULL << 20)) / 4096;
++    }
+     overlay.bytes = bytes;
+     overlay.pages = static_cast<uint8_t **> (IOMallocZero ((bytes / 4096) * sizeof (uint8_t *)));
+     if (!overlay.pages) return false;
+@@ -1564,6 +1569,31 @@
+ {
+   NativeUfsBlock *window = gDrvWindow;
+   return window ? window->readRaw (offset, out, length) : kIOReturnNotReady;
++}
++
++// uke: raw writes of the DRV window outside IOStorage, for UkeGpu's persistent pipeline cache. Only the range hostWrite4k admits
++// (gDrvWriteFirst..): never the GPT head or the firmware table. Forced unit access, so a completed write is on the medium.
++IOReturn NativeUfsBlock::writeRaw (uint64_t offset, const void *in, uint32_t length)
++{
++  if (!online) return kIOReturnNotReady;
++  if (!in || !length || ((offset | length) & 4095) || offset >= bytes || length > bytes - offset)
++    return kIOReturnBadArgument;
++  IOReturn result = kIOReturnSuccess;
++  IOLockLock (windowLock);
++  for (uint32_t done = 0; done < length && result == kIOReturnSuccess;) {
++    uint32_t chunk = length - done < kDataMax ? length - done : kDataMax;
++    memcpy (bounce, static_cast<const uint8_t *> (in) + done, chunk);
++    result = hostWrite4k (0, (absolute + offset + done) / 4096, chunk / 4096, bounce, true);
++    done += chunk;
++  }
++  IOLockUnlock (windowLock);
++  return result;
++}
++
++extern "C" IOReturn native_ufs_drv_write (uint64_t offset, const void *in, uint32_t length)
++{
++  NativeUfsBlock *window = gDrvWindow;
++  return window ? window->writeRaw (offset, in, length) : kIOReturnNotReady;
+ }
+ #endif
+ 
+--- a/RootCommands.h
++++ b/RootCommands.h
+@@ -297,11 +297,17 @@
+   gStoreOpen = true;
+   return true;
+ }
++
++// uke: the part of the DRV window UkeGpu may write raw (its persistent pipeline-cache slots): set once the DRV window is configured,
++// from its second MiB to the start of its last MiB (the GPT head and the GPU firmware table stay read-only).
++static uint64_t gDrvWriteFirst, gDrvWriteBlocks;
+ 
+ // WRITE(10) of 4096-byte blocks; both LUN and range must match an explicitly opened window.
+ static IOReturn hostWrite4k (uint8_t lun, uint64_t lba, uint32_t blocks, const void *src, bool fua = false)
+ {
+   bool allowed = lun == 0 && hostInWindow(lba, blocks);
++  if (lun == 0 && gDrvWriteBlocks && lba >= gDrvWriteFirst && lba - gDrvWriteFirst < gDrvWriteBlocks)
++    allowed = blocks <= gDrvWriteBlocks - (lba - gDrvWriteFirst);
+ #if defined(NATIVE_MACOSLOG) && NATIVE_MACOSLOG
+   if (lun == 0 && gMacosLogOpen && lba >= gMacosLogFirst && lba - gMacosLogFirst < gMacosLogBlocks)
+     allowed = blocks <= gMacosLogBlocks - (lba - gMacosLogFirst);

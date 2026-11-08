@@ -1,0 +1,413 @@
+--- a/RootTransportLayout.h	2026-11-08 00:38:36
++++ b/RootTransportLayout.h	2026-11-08 00:42:26
+@@ -9,5 +9,11 @@
+   kDataMax = 524288,
+   kPrdtEntryMax = 262144,
+   kPrdtEntries = kDataMax / kPrdtEntryMax,
+-  kDmaBytes = kDataOffset + kDataMax,
++  // uke (2026-11-08): read slots 1..kReadSlotsMax, each with its own UPIU page (command, response, PRDT) and a kDataMax data area,
++  // after slot 0's data. Slot 0 keeps every other command (writes, queries, sync) exactly as before.
++  kReadSlotsMax = 4,
++  kSlotUcdBytes = 4096,
++  kSlotStride = kSlotUcdBytes + kDataMax,
++  kReadSlotsOffset = kDataOffset + kDataMax,
++  kDmaBytes = kReadSlotsOffset + kReadSlotsMax * kSlotStride,
+ };
+--- a/RootCommands.h	2026-11-08 00:38:36
++++ b/RootCommands.h	2026-11-08 00:42:26
+@@ -36,7 +36,7 @@
+   if (!timeoutUs || dataBytes > kDataMax || (dataBytes & 3) ||
+       (dataBytes ? (direction != 1 && direction != 2) : direction != 0)) return kIOReturnBadArgument;
+   if (gHost.poisoned) return kIOReturnNotReady;
+-  if (read32 (gHost.hc, 0x58) != 0) {
++  if (read32 (gHost.hc, 0x58) & 1) {   // uke: slot 0 only; read slots 1..4 may be in flight
+     gHost.poisoned = true;
+     gHost.ready = false;
+     return recordTransport (kIOReturnBusy, *ocs);
+@@ -78,7 +78,10 @@
+     prd[2] = 0;
+     prd[3] = bytes - 1;
+   }
+-  cacheCivac (gHost.virt, kDataOffset + dataBytes);
++  // uke: only slot 0's own lines (its UTRD line, then its UPIU page and data): the read slots' descriptors live in lines 1..4 of the
++  // request list and another thread may have just written one of them.
++  cacheCivac (gHost.virt, 64);
++  cacheCivac (gHost.virt + kUcdOffset, kDataOffset - kUcdOffset + dataBytes);
+   hostWrite (0x20, 1);  // Acknowledge completion only; preserve error evidence.
+   HardwareTransferPort port;
+   clock_interval_to_deadline (timeoutUs, kMicrosecondScale, &port.deadline);
+@@ -96,7 +99,8 @@
+     gHost.ready = false;
+     return recordTransport (end == UfsTransferEnd::Timeout ? kIOReturnTimeout : kIOReturnIOError, *ocs);
+   }
+-  cacheInvalidate (gHost.virt, kDataOffset + dataBytes);
++  cacheInvalidate (gHost.virt, 64);
++  cacheInvalidate (gHost.virt + kUcdOffset, kDataOffset - kUcdOffset + dataBytes);
+   gRootDiagnostic.response = loadBe32 (gHost.virt + kUcdOffset + kRspOffset);
+   return recordTransport (*ocs == 0 ? kIOReturnSuccess : kIOReturnIOError, *ocs);
+ }
+@@ -104,8 +108,8 @@
+ static bool hostClearUcd (void)
+ {
+   if (gHost.poisoned) return false;
+-  // Check before touching the command/response area, not just before ringing.
+-  if (read32 (gHost.hc, 0x58) != 0) {
++  // Check before touching the command/response area, not just before ringing (slot 0's doorbell bit; read slots run beside it).
++  if (read32 (gHost.hc, 0x58) & 1) {
+     gHost.poisoned = true;
+     gHost.ready = false;
+     recordTransport (kIOReturnBusy, 15);
+@@ -238,6 +242,115 @@
+   }
+   *value = loadBe32 (rsp + 20);
+   return kIOReturnSuccess;
++}
++
++// uke (2026-11-08): parallel reads. Up to kReadSlotsMax READ(10) commands in flight at once in request slots 2, 4, 6, 8, each with its own
++// UPIU page, PRDT, data area and task tag (= slot), so reads from different threads overlap in the device instead of queueing behind
++// slot 0's single command. Completion is the slot's doorbell bit clearing with its UTRD OCS written, as for slot 0. A timeout or a
++// fatal controller status poisons the host exactly like slot 0 (no retry, the slot stays owned). uke-ufs-slots=<0..4> (default 4;
++// 0 = every read through slot 0 as before), capped by the controller's NUTRS.
++static uint32_t gReadSlots = 0, gReadSlotBusy = 0;
++static IOLock *gReadSlotLock = nullptr;
++// uke_ufs_slots (NativeUfs.cpp, global): [0] slots, [1] reads through them, [2] most in flight at once, [3] waits for a slot
++static void hostReadSlotsInit (void)
++{
++  uint32_t want = kReadSlotsMax;
++  if (PE_parse_boot_argn ("uke-ufs-slots", &want, sizeof (want)) && want > kReadSlotsMax) want = kReadSlotsMax;
++  // Request slots 2, 4, 6, 8: a UTRD is 32 bytes, so an even slot has its 64-byte cache line alone (slot 0 and slot 1 share one, and a
++  // CPU write-back of a line holding another slot's descriptor could undo the OCS the controller just wrote there).
++  const uint32_t nutrs = (read32 (gHost.hc, 0x00) & 0x1f) + 1;
++  if (want > (nutrs - 1) / 2) want = (nutrs - 1) / 2;
++  if (!gReadSlotLock) gReadSlotLock = IOLockAlloc ();
++  gReadSlots = gReadSlotLock ? want : 0;
++  uke_ufs_slots[0] = gReadSlots;
++}
++static IOReturn hostReadSlot (uint8_t lun, uint64_t lba, uint32_t blocks, void *dst)
++{
++  IOLockLock (gReadSlotLock);
++  int slot = -1;
++  for (;;) {
++    if (gHost.poisoned || !gHost.ready) { IOLockUnlock (gReadSlotLock); return kIOReturnNotReady; }
++    for (uint32_t i = 0; i < gReadSlots; i++) if (!(gReadSlotBusy & (1U << i))) { slot = int (i); break; }
++    if (slot >= 0) break;
++    uke_ufs_slots[3] = uke_ufs_slots[3] + 1;
++    IOLockSleep (gReadSlotLock, &gReadSlotBusy, THREAD_UNINT);
++  }
++  gReadSlotBusy |= 1U << slot;
++  uint32_t inFlight = __builtin_popcount (gReadSlotBusy);
++  if (inFlight > uke_ufs_slots[2]) uke_ufs_slots[2] = inFlight;
++  IOLockUnlock (gReadSlotLock);
++
++  const uint32_t tag = 2U * (uint32_t (slot) + 1), bit = 1U << tag, bytes = blocks * 4096U;
++  uint8_t *ucd = gHost.virt + kReadSlotsOffset + uint64_t (slot) * kSlotStride, *data = ucd + kSlotUcdBytes;
++  const uint64_t ucdPhys = gHost.phys + kReadSlotsOffset + uint64_t (slot) * kSlotStride, dataPhys = ucdPhys + kSlotUcdBytes;
++  memset (ucd, 0, kPrdtOffset + 16 * kPrdtEntries);
++  ucd[0] = 0x01;                      // COMMAND UPIU
++  ucd[1] = 0x40;                      // R: data in
++  ucd[2] = lun;
++  ucd[3] = uint8_t (tag);             // task tag: unique among commands in flight
++  putBe32 (ucd + 12, bytes);
++  const uint8_t cdb[10] = { 0x28, 0, uint8_t (lba >> 24), uint8_t (lba >> 16), uint8_t (lba >> 8), uint8_t (lba),
++                            0, uint8_t (blocks >> 8), uint8_t (blocks), 0 };
++  memcpy (ucd + 16, cdb, sizeof (cdb));
++  const uint32_t entries = (bytes + kPrdtEntryMax - 1) / kPrdtEntryMax;
++  for (uint32_t entry = 0; entry < entries; entry++) {
++    uint32_t *prd = reinterpret_cast<uint32_t *> (ucd + kPrdtOffset) + entry * 4;
++    uint32_t part = bytes - entry * kPrdtEntryMax;
++    if (part > kPrdtEntryMax) part = kPrdtEntryMax;
++    const uint64_t at = dataPhys + uint64_t (entry) * kPrdtEntryMax;
++    prd[0] = uint32_t (at); prd[1] = uint32_t (at >> 32); prd[2] = 0; prd[3] = part - 1;
++  }
++  uint32_t *words = reinterpret_cast<uint32_t *> (gHost.virt + tag * 32);
++  for (unsigned index = 0; index < 8; index++) words[index] = 0;
++  words[0] = 0x10000000U | (2U << 25);
++  words[2] = 0x0fU;
++  words[4] = uint32_t (ucdPhys);
++  words[5] = uint32_t (ucdPhys >> 32);
++  words[6] = (512U >> 2) | ((kRspOffset >> 2) << 16);
++  words[7] = entries | ((kPrdtOffset >> 2) << 16);
++  cacheCivac (words, 32);
++  cacheCivac (ucd, kSlotUcdBytes);
++  cacheCivac (data, bytes);           // no dirty line may be written back over the DMA result
++  hostWrite (0x58, bit);              // UTRLDBR is write-one-to-set: the other slots' bits are untouched
++  uint64_t deadline = 0;
++  clock_interval_to_deadline (1000000, kMicrosecondScale, &deadline);
++  uint32_t ocs = 15;
++  bool failed = false;
++  for (;;) {
++    const uint32_t doorbell = read32 (gHost.hc, 0x58);
++    if (read32 (gHost.hc, 0x20) & kUfsFatalStatus) { failed = true; break; }
++    if (!(doorbell & bit)) {
++      cacheInvalidate (words, 64);
++      ocs = words[2] & 0xff;
++      if (ocs != 15) break;
++    }
++    if (mach_absolute_time () >= deadline) { failed = true; break; }
++    IODelay (2);
++  }
++  if (failed) {
++    // As slot 0: the controller may still own the buffers, so nothing is freed or retried and the host stops.
++    gHost.poisoned = true;
++    gHost.ready = false;
++    IOLockLock (gReadSlotLock); IOLockWakeup (gReadSlotLock, &gReadSlotBusy, false); IOLockUnlock (gReadSlotLock);
++    return recordTransport (kIOReturnTimeout, ocs);
++  }
++  IOReturn status = kIOReturnSuccess;
++  if (ocs != 0) status = kIOReturnIOError;
++  else {
++    cacheInvalidate (ucd + kRspOffset, 512);
++    cacheInvalidate (data, bytes);
++    const uint8_t *rsp = ucd + kRspOffset;
++    const uint32_t scsi = (uint32_t (rsp[6]) << 8) | rsp[7];
++    if (rsp[0] != 0x21 || rsp[3] != uint8_t (tag) || rsp[2] != lun || scsi || (rsp[1] & 0x60) || loadBe32 (rsp + 12))
++      status = kIOReturnIOError;
++    else memcpy (dst, data, bytes);
++  }
++  uke_ufs_slots[1] = uke_ufs_slots[1] + 1;
++  IOLockLock (gReadSlotLock);
++  gReadSlotBusy &= ~(1U << slot);
++  IOLockWakeup (gReadSlotLock, &gReadSlotBusy, false);
++  IOLockUnlock (gReadSlotLock);
++  return status;
+ }
+ 
+ // Read `blocks` (<= kDataMax / 4096) 4096-byte blocks of LUN `lun` starting at `lba` into dst.
+@@ -246,6 +359,7 @@
+   if (!gHost.ready || !dst || !blocks || blocks > kDataMax / 4096 || lba > 0xffffffffULL - (blocks - 1)) {
+     return kIOReturnBadArgument;
+   }
++  if (gReadSlots) return hostReadSlot (lun, lba, blocks, dst);
+   IOLockLock (gHost.lock);
+   gRootDiagnostic.lba = lba;
+   uint8_t cdb[10] = { 0x28, 0, uint8_t (lba >> 24), uint8_t (lba >> 16), uint8_t (lba >> 8), uint8_t (lba),
+--- a/NativeUfs.cpp	2026-11-08 00:38:36
++++ b/NativeUfs.cpp	2026-11-08 00:42:26
+@@ -802,6 +802,7 @@
+ // Nothing here writes to the storage: only INQUIRY-class and READ(10) commands are built, plus
+ // the single START STOP UNIT that wakes the device from the power-down the firmware left.
+ // ======================================================================================
++extern "C" volatile uint64_t uke_ufs_slots[4];   // uke: parallel read slot counters (RootCommands.h)
+ namespace {
+ #include "RootTransportLayout.h"
+ 
+@@ -971,6 +972,7 @@
+     uint32_t scsi = 0;
+     if (hostScsi (0, tur, 6, false, 0, 200000, &scsi) == kIOReturnSuccess) {
+       gHost.ready = true;
++      hostReadSlotsInit ();
+       return true;
+     }
+     if (gHost.poisoned) break;
+@@ -1214,7 +1216,36 @@
+ volatile uint64_t native_ufs_isc_writes = 0, native_ufs_isc_syncs = 0;
+ volatile uint64_t native_ufs_isc_resident_bytes = 0, native_ufs_isc_failures = 0;
+ volatile uint32_t native_ufs_isc_overlay_enabled = 0;
++}
++// uke (2026-11-08): bounce buffers for shared (concurrent) reads, kDataMax each, made on first use and kept. A writer has the window
++// alone and uses the window's own bounce buffer. The lock is made by the first window's configure, before any I/O.
++static IOLock *gUkeBounceLock;
++static uint8_t *gUkeBounce[kReadSlotsMax + 4];
++static uint32_t gUkeBounceBusy;
++static uint8_t *ukeReadBounceTake ()
++{
++  if (!gUkeBounceLock) return nullptr;
++  IOLockLock (gUkeBounceLock);
++  for (;;) {
++    for (uint32_t i = 0; i < kReadSlotsMax + 4; i++) {
++      if (gUkeBounceBusy & (1U << i)) continue;
++      if (!gUkeBounce[i]) gUkeBounce[i] = static_cast<uint8_t *> (IOMalloc (kDataMax));
++      if (!gUkeBounce[i]) continue;
++      gUkeBounceBusy |= 1U << i;
++      IOLockUnlock (gUkeBounceLock);
++      return gUkeBounce[i];
++    }
++    if (!gUkeBounceBusy) { IOLockUnlock (gUkeBounceLock); return nullptr; }   // nothing allocatable and nothing to wait for
++    IOLockSleep (gUkeBounceLock, &gUkeBounceBusy, THREAD_UNINT);
++  }
+ }
++static void ukeReadBounceGive (uint8_t *buffer)
++{
++  IOLockLock (gUkeBounceLock);
++  for (uint32_t i = 0; i < kReadSlotsMax + 4; i++) if (gUkeBounce[i] == buffer) gUkeBounceBusy &= ~(1U << i);
++  IOLockWakeup (gUkeBounceLock, &gUkeBounceBusy, false);
++  IOLockUnlock (gUkeBounceLock);
++}
+ class NativeUfsBlock : public IOBlockStorageDevice {
+   OSDeclareDefaultStructors (NativeUfsBlock)
+   uint64_t absolute = 0;      // byte offset of the window on LUN 0
+@@ -1222,6 +1253,9 @@
+   char label[32] = {};
+   uint8_t *bounce = nullptr;
+   IOLock *windowLock = nullptr;
++  // uke (2026-11-08): reads of a window share it, writes (and the store attach, raw I/O) have it alone, so concurrent reads reach the
++  // UFS read slots together. Each shared read takes its own bounce buffer from ukeReadBounce*().
++  IORWLock *windowRw = nullptr;
+   RamSparseDisk overlay = {};
+   uint8_t *ukeSlab = nullptr;      // uke: this window's current 2 MiB overlay slab (see OverlayOperations)
+   uint64_t ukeSlabUsed = 2ULL << 20;
+@@ -1271,9 +1305,9 @@
+   IOReturn reportWriteProtection (bool *value) override { *value = !overlay.pages; return kIOReturnSuccess; }
+   IOReturn doSynchronizeCache () override {
+     if (!online) return kIOReturnNotReady;
+-    IOLockLock (windowLock);
++    IORWLockWrite (windowRw);
+     if (overlay.pages) __atomic_fetch_add (&native_ufs_isc_syncs, 1, __ATOMIC_RELAXED);
+-    IOLockUnlock (windowLock);
++    IORWLockUnlock (windowRw);
+     return kIOReturnSuccess;
+   }
+   IOReturn doSynchronize (UInt64, UInt64, IOOptionBits) override { return doSynchronizeCache (); }
+@@ -1396,7 +1430,9 @@
+   if (!described) return false;
+ #endif
+   windowLock = IOLockAlloc ();
+-  if (!windowLock) return false;
++  windowRw = IORWLockAlloc ();
++  if (!gUkeBounceLock) gUkeBounceLock = IOLockAlloc ();
++  if (!windowLock || !windowRw) return false;
+   bounce = static_cast<uint8_t *> (IOMalloc (kDataMax));
+   if (!bounce) {
+     return false;
+@@ -1415,6 +1451,7 @@
+ // uke: block requests the system makes (all windows): [0..2] reads, bytes, ticks (lock wait included), [3..5] writes, bytes, ticks,
+ // [6..8] media reads the RAM overlay path issued (commands, bytes, ticks), [9] longest read request in ticks. Ticks are CNTPCT (19.2 MHz).
+ extern "C" {volatile uint64_t uke_ufs_io[10];}
++extern "C" {volatile uint64_t uke_ufs_slots[4];}
+ static inline uint64_t timerTicks (void) {uint64_t v; __asm__ volatile ("isb\n\tmrs %0, cntpct_el0" : "=r" (v)); return v;}
+ 
+ #if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
+@@ -1564,14 +1601,14 @@
+   if (!out || !length || ((offset | length) & 4095) || offset >= bytes || length > bytes - offset)
+     return kIOReturnBadArgument;
+   IOReturn result = kIOReturnSuccess;
+-  IOLockLock (windowLock);
++  IORWLockWrite (windowRw);
+   for (uint32_t done = 0; done < length && result == kIOReturnSuccess;) {
+     uint32_t chunk = length - done < kDataMax ? length - done : kDataMax;
+     result = hostRead4k (0, (absolute + offset + done) / 4096, chunk / 4096, bounce);
+     if (result == kIOReturnSuccess) memcpy (static_cast<uint8_t *> (out) + done, bounce, chunk);
+     done += chunk;
+   }
+-  IOLockUnlock (windowLock);
++  IORWLockUnlock (windowRw);
+   return result;
+ }
+ 
+@@ -1589,14 +1626,14 @@
+   if (!in || !length || ((offset | length) & 4095) || offset >= bytes || length > bytes - offset)
+     return kIOReturnBadArgument;
+   IOReturn result = kIOReturnSuccess;
+-  IOLockLock (windowLock);
++  IORWLockWrite (windowRw);
+   for (uint32_t done = 0; done < length && result == kIOReturnSuccess;) {
+     uint32_t chunk = length - done < kDataMax ? length - done : kDataMax;
+     memcpy (bounce, static_cast<const uint8_t *> (in) + done, chunk);
+     result = hostWrite4k (0, (absolute + offset + done) / 4096, chunk / 4096, bounce, true);
+     done += chunk;
+   }
+-  IOLockUnlock (windowLock);
++  IORWLockUnlock (windowRw);
+   return result;
+ }
+ 
+@@ -1659,13 +1696,14 @@
+     return kIOReturnNotReady;
+   }
+   struct Operations {
+-    IOLock *mutex;
++    IORWLock *mutex;
++    bool shared;
+     IOMemoryDescriptor *buffer;
+ #if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
+     const vr_view *view;
+ #endif
+-    void lock () { IOLockLock (mutex); }
+-    void unlock () { IOLockUnlock (mutex); }
++    void lock () { if (shared) IORWLockRead (mutex); else IORWLockWrite (mutex); }
++    void unlock () { IORWLockUnlock (mutex); }
+     IOReturn read (uint64_t lba, uint32_t blocks, void *out) {
+       uint64_t t0 = timerTicks ();
+       IOReturn r = hostRead4k (0, lba, blocks, out);
+@@ -1695,23 +1733,28 @@
+       if (copied == length) __atomic_fetch_add (&native_ufs_block_reads, 1, __ATOMIC_RELAXED);
+       return copied;
+     }
+-  } operations = { windowLock, buffer
++  } operations = { windowRw, !write, buffer
+ #if defined(NATIVE_VERIFIED_BLOCK) && NATIVE_VERIFIED_BLOCK
+     , &verified
+ #endif
+   };
+   UfsWindowResult outcome;
++  // A shared read gets its own bounce buffer (another reader may be using the window's); without one it reads alone, as before.
++  uint8_t *readBounce = write ? nullptr : ukeReadBounceTake ();
++  if (!write && !readBounce) operations.shared = false;
++  uint8_t *io = readBounce ? readBounce : bounce;
+   if (ukePersistWanted && !ukePersistTried) {
+-    IOLockLock (windowLock);
++    IORWLockWrite (windowRw);
+     if (!ukePersistTried) { ukePersistTried = true; ukeAttachPersist (); }
+-    IOLockUnlock (windowLock);
++    IORWLockUnlock (windowRw);
+   }
+   if (ukePersist.active) {
+     struct PersistOperations {
+-      IOLock *mutex;
++      IORWLock *mutex;
++      bool shared;
+       IOMemoryDescriptor *buffer;
+-      void lock () { IOLockLock (mutex); }
+-      void unlock () { IOLockUnlock (mutex); }
++      void lock () { if (shared) IORWLockRead (mutex); else IORWLockWrite (mutex); }
++      void unlock () { IORWLockUnlock (mutex); }
+       IOReturn read (uint64_t lba, uint32_t blocks, void *out) {
+         const uint64_t t0 = timerTicks ();
+         IOReturn r = hostRead4k (0, lba, blocks, out);
+@@ -1720,9 +1763,9 @@
+       }
+       uint64_t load (uint64_t offset, void *out, uint64_t length) { return buffer->readBytes (offset, out, length); }
+       uint64_t copy (uint64_t offset, const void *data, uint64_t length) { return buffer->writeBytes (offset, data, length); }
+-    } persistOps = { windowLock, buffer };
++    } persistOps = { windowRw, readBounce != nullptr, buffer };
+     UfsPersistStore store;
+-    outcome = ufsPersistIO (persistOps, ukePersist, store, absolute, bytes, write, block, count, bounce);
++    outcome = ufsPersistIO (persistOps, ukePersist, store, absolute, bytes, write, block, count, io);
+     if (outcome.status == kIOReturnNotWritable) {
+       // A store write failed: no later write may be reported done; reads still see what reached the store.
+       ukePersist.readOnly = true;
+@@ -1733,10 +1776,11 @@
+   } else if (overlay.pages) {
+     static constexpr uint64_t kUkeSlab = 2ULL << 20;
+     struct OverlayOperations {
+-      IOLock *mutex;
++      IORWLock *mutex;
++      bool shared;
+       IOMemoryDescriptor *buffer;
+-      void lock () { IOLockLock (mutex); }
+-      void unlock () { IOLockUnlock (mutex); }
++      void lock () { if (shared) IORWLockRead (mutex); else IORWLockWrite (mutex); }
++      void unlock () { IORWLockUnlock (mutex); }
+       // uke: carve pages from 2 MiB slabs. Hundreds of thousands of IOMalloc(4096) calls exhaust the kalloc zone long
+       // before the overlay limit while full macOS writes its first-boot data; slabs come from the kernel map instead.
+       uint8_t *&slab;
+@@ -1761,15 +1805,16 @@
+       }
+       uint64_t load (uint64_t offset, void *out, uint64_t length) { return buffer->readBytes (offset, out, length); }
+       uint64_t copy (uint64_t offset, const void *data, uint64_t length) { return buffer->writeBytes (offset, data, length); }
+-    } overlayOps = { windowLock, buffer, ukeSlab, ukeSlabUsed };
+-    outcome = ufsOverlayIO (overlayOps, overlay, absolute, write, block, count, kOverlayLimit, bounce);
++    } overlayOps = { windowRw, readBounce != nullptr, buffer, ukeSlab, ukeSlabUsed };
++    outcome = ufsOverlayIO (overlayOps, overlay, absolute, write, block, count, kOverlayLimit, io);
+     native_ufs_isc_resident_bytes = overlay.resident;
+     if (outcome.status != kIOReturnSuccess) __atomic_fetch_add (&native_ufs_isc_failures, 1, __ATOMIC_RELAXED);
+     else if (write) __atomic_fetch_add (&native_ufs_isc_writes, 1, __ATOMIC_RELAXED);
+     else __atomic_fetch_add (&native_ufs_block_reads, 1, __ATOMIC_RELAXED);
+   } else {
+-    outcome = ufsReadWindow (operations, absolute, bytes, block, count, bounce);
++    outcome = ufsReadWindow (operations, absolute, bytes, block, count, io);
+   }
++  if (readBounce) ukeReadBounceGive (readBounce);
+   IOReturn result = outcome.status;
+   uint64_t done = outcome.done;
+   if (result != kIOReturnSuccess) {

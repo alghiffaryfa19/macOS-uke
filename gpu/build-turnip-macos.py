@@ -39,6 +39,13 @@ def main():
     pins = json.loads((TREE / 'scripts/data/adreno-compiler-inputs.json').read_text())
     if read(['git', '-C', SOURCE, 'rev-parse', 'HEAD']) != pins['mesa']['commit']:
         sys.exit('Pinned Mesa source differs')
+    # macOS-only Turnip patches on top of the iPadOS 27 sequence: applied once to the shared checkout, then recorded.
+    for patch in sorted((HERE / 'turnip').glob('*.patch')):
+        applied = subprocess.run(['git', 'apply', '--reverse', '--check', str(patch)], cwd=SOURCE,
+                                 env=dict(os.environ, GIT_DIR='/dev/null'), capture_output=True)
+        if applied.returncode:
+            subprocess.run(['git', 'apply', str(patch)], cwd=SOURCE, env=dict(os.environ, GIT_DIR='/dev/null'), check=True)
+        pins['patches'].append(str(patch))
     validate_recorded_patches(TREE, SOURCE, pins)
     env = {k: v for k, v in os.environ.items() if not k.startswith(('IR3_', 'FD_MESA_', 'NIR_', 'MESA_SHADER_', 'TU_'))}
     env['PATH'] = str(TREE / '.cache/mesa-tools/bin') + ':' + str(TREE / '.cache/mesa-venv/bin') + ':' + env['PATH']

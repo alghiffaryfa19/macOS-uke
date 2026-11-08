@@ -21,13 +21,23 @@ diff --git a/NativeUfs.cpp b/NativeUfs.cpp
  
  extern "C" {
  volatile uint32_t native_ufs_blocks_published = 0;
-@@ -1323,6 +1329,10 @@
+@@ -1323,6 +1329,20 @@
    strlcpy (label, name, sizeof (label));
    absolute = absoluteOffset;
    bytes = size;
 +#if defined(NATIVE_UFS_DRV_BYTES)
-+  // uke: the DRV window has no overlay (read-only, rewritten with dd from recovery); UkeGpu reads raw firmware from it.
-+  if (!strcmp (label, "DRV")) gDrvWindow = this;
++  // uke: UkeGpu reads raw firmware from the DRV window (rewritten with dd from recovery). It also gets a small volatile
++  // RAM overlay like OS and ISC: without one the media is write-protected and APFS refuses to load its container for
++  // fsck/mount ("get_nx: container_load failed with 13", log M2i 2026-11-07), so UKEDRV never mounted. Writes stay in
++  // RAM; the UFS seed and the firmware table (read with readRaw, outside the overlay) are never changed.
++  if (!strcmp (label, "DRV")) {
++    gDrvWindow = this;
++    if (bytes & 4095) return false;
++    overlay.bytes = bytes;
++    overlay.pages = static_cast<uint8_t **> (IOMallocZero ((bytes / 4096) * sizeof (uint8_t *)));
++    if (!overlay.pages) return false;
++    kOverlayLimit = 64ULL << 20;
++  }
 +#endif
  #if defined(NATIVE_UFS_RECOVERY_ROOT) && NATIVE_UFS_RECOVERY_ROOT
    uint32_t requested = 0;

@@ -1,5 +1,205 @@
+diff --git a/CacheExport.h b/CacheExport.h
+index 191f28c..f90a3ed 100644
+--- a/CacheExport.h
++++ b/CacheExport.h
+@@ -155,7 +155,7 @@ struct PackReader {
+     z_stream z = {};
+     InflateFn inflateFn = nullptr;
+     EndFn endFn = nullptr;
+-    bool open = false, ended = false;
++    bool open = false, ended = false, raw = false;   // raw: an export blob ("SHEXR001"), the stream as it is (uke macOS, DRV cache)
+     uint64_t left = 0, produced = 0, expect = 0;   // compressed bytes not yet read from the file, stream bytes produced, stream bytes announced
+     uint8_t input[65536];
+     ~PackReader() {if (open) endFn(&z); if (in) fclose(in);}
+@@ -175,7 +175,14 @@ struct PackReader {
+         source = std::move(read);
+         uint8_t head[16];
+         uint32_t raw = 0, zbytes = 0;
+-        if (!init || !inflateFn || !endFn || !source(head, 16) || memcmp(head, "SHEXP001", 8)) return false;
++        if (!source(head, 16)) return false;
++        if (!memcmp(head, "SHEXR001", 8)) {
++            memcpy(&expect, head + 8, 4);
++            if (expect != bytes - 16) return false;
++            this->raw = true; left = expect;
++            return true;
++        }
++        if (!init || !inflateFn || !endFn || memcmp(head, "SHEXP001", 8)) return false;
+         memcpy(&raw, head + 8, 4);
+         memcpy(&zbytes, head + 12, 4);
+         if ((uint64_t)zbytes != bytes - 16) return false;
+@@ -184,6 +191,11 @@ struct PackReader {
+         return open;
+     }
+     bool read(void *out, size_t n) {
++        if (raw) {
++            if (n > left || !source(out, n)) return false;
++            left -= n; produced += n;
++            return true;
++        }
+         z.next_out = static_cast<Bytef *>(out);
+         z.avail_out = (uInt)n;
+         while (z.avail_out) {
+@@ -211,6 +223,7 @@ struct PackReader {
+     }
+     // The whole stream was consumed: zlib's check passed at its end and nothing follows it.
+     bool finished() {
++        if (raw) return produced == expect && !left;
+         if (!ended) {uint8_t b; if (read(&b, 1)) return false;}
+         return ended && produced == expect && !left && !z.avail_in;
+     }
+@@ -220,14 +233,14 @@ struct PackReader {
+ // scripts/add-gpu-plugin-data.py --pipeline-pack). Its files go into this process's own cache directory, so they carry this process's owner
+ // and mode; a file that is already there with the same size is kept. Files are written beside their place and renamed only once the
+ // whole pack has been read and checked: a damaged pack imports nothing. Returns the number of files written, or -1.
+-static int importStream(PackReader &r, const std::string &directory);
++static int importStream(PackReader &r, const std::string &directory, bool markBaked = true);
+ static int importPack(const char *pack, const std::string &directory) {
+     if (access(pack, R_OK) != 0) return 0;
+     PackReader r;
+     if (!r.start(pack)) return -1;
+     return importStream(r, directory);
+ }
+-static int importStream(PackReader &r, const std::string &directory) {
++static int importStream(PackReader &r, const std::string &directory, bool markBaked) {
+     static std::atomic<unsigned long long> importSequence{0};
+     const std::string suffix=".import."+std::to_string(getpid())+"."+std::to_string(importSequence.fetch_add(1));
+     std::vector<std::string> written;
+@@ -267,11 +280,44 @@ static int importStream(PackReader &r, const std::string &directory) {
+     if (!r.finished()) return fail();
+     int renamed = 0;
+     for (const std::string &f : written) if (rename((f + suffix).c_str(), f.c_str()) == 0) ++renamed; else unlink((f + suffix).c_str());
+-    baked().insert(seen.begin(), seen.end());   // only a pack read to its end counts
++    if (markBaked) baked().insert(seen.begin(), seen.end());   // only a pack read to its end counts
+     return renamed;
+ }
+ 
+ #ifndef CACHEEXPORT_FORMAT_ONLY
++// uke macOS: the newest export the kernel keeps in the DRV window (macos/UkeGpu.cpp, method 0x7101), into the cache directory before
++// the device opens. Its files are not marked baked: the next export sends them again with this boot's new ones, so the slot always
++// holds the union of every boot. Marker 0x6Dnn: files written (saturated at 0xfe), 0x6Dff refused, 0x6Df0 no connection.
++static int importKernel(Gpu &marker, const std::string &directory) {
++    Gpu link;
++    link.call = marker.call; link.openFn = marker.openFn; link.closeFn = marker.closeFn; link.port = marker.port;
++    if (!link.openFn || link.openFn(link.port, mach_task_self(), 0x4148, &link.conn) != 0 || !link.conn || !link.probe()) {
++        marker.mark(0x6Df0); return -1;
++    }
++    struct Request {uint32_t offset, bytes;};
++    uint32_t answer[2] = {};
++    Request query = {0, 0};
++    int result = 0;
++    if (link.method(0x7101, &query, sizeof query, answer, sizeof answer) == 0 && answer[0] > 16) {
++        uint32_t offset = 0;
++        const uint32_t total = answer[0];
++        PackReader r;
++        auto source = [&](void *out, size_t n) {
++            for (size_t done = 0; done < n;) {
++                const uint32_t k = (uint32_t)(n - done < kPiece ? n - done : kPiece);
++                Request piece = {offset, k};
++                if (link.method(0x7101, &piece, sizeof piece, static_cast<uint8_t *>(out) + done, k) != 0) return false;
++                offset += k; done += k;
++            }
++            return true;
++        };
++        result = r.startWith(source, total) ? importStream(r, directory, false) : -1;
++    }
++    if (link.closeFn) link.closeFn(link.conn);
++    if (result) marker.mark(0x6D00 | (result < 0 ? 0xff : result > 0xfe ? 0xfe : result));
++    return result;
++}
++
+ // Markers 0x69xx: 00 started, 01 connection, 02 an export went out (then 0x6Bnn: its size in MiB, saturated), f0 no connection,
+ // f1 no selector, f2 a file changed or vanished while it was read, f3 a piece refused, f4 the new files exceed one export.
+ static void run(Gpu &marker, std::string root) {
+diff --git a/GpuScanoutClient.h b/GpuScanoutClient.h
+index 7b259b5..edbb395 100644
+--- a/GpuScanoutClient.h
++++ b/GpuScanoutClient.h
+@@ -99,7 +99,7 @@ public:
+             stats_->totalMs += stats_->lastMs;
+         }
+         stats_->lastResult = (int)r;
+-        if (r == gpupresent::kOk && swap.format == NGP_BGRX8888 && stats_->verified < 4) verify(swap);
++        if (r == gpupresent::kOk && swap.format == NGP_BGRX8888 && swap.width == scanout_.width && stats_->verified < 4) verify(swap);   // uke: 1:1 only
+         note(0x6731);   // the GPU copy returned
+         const uint64_t copiedUs = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) / 1000;
+         NGPComplete done = {swap.sequence, r == gpupresent::kOk ? 0u : 0xe00002bcu /* kIOReturnError */, 0};
+diff --git a/GpuScanoutPresenter.h b/GpuScanoutPresenter.h
+index 8c64a98..df5bee7 100644
+--- a/GpuScanoutPresenter.h
++++ b/GpuScanoutPresenter.h
+@@ -19,6 +19,8 @@
+ // The conversion kernel's AIR and the frontend's loader for bare AIR (both in the plugin; weak, so a device without them only blits).
+ extern "C" const void *nmb_scanout_convert_air(size_t *length) __attribute__((weak_import));
+ extern "C" id native_bridge_metal_library_with_air(const void *bytes, size_t length) __attribute__((weak_import));
++// uke macOS: the 2x scanout kernel (boot/macos-gpu/plugin/scanout_x2.ll, linked into the plugin by build-plugin-macos.py).
++extern "C" const void *uke_scanout_x2_air(size_t *length) __attribute__((weak_import));
+ 
+ namespace gpupresent {
+ 
+@@ -56,6 +58,8 @@ public:
+         if (!ready()) return kBadScanout;
+         if (frame.format == NGP_RGBA16F_LINEAR || frame.format == NGP_RGBA16F_ENCODED) return convert(frame);
+         if (frame.format != NGP_BGRX8888) return kBadFrame;
++        // uke macOS (native-gop-scale=2): the compositor's surface is half the panel each way; the GPU doubles it into the scanout.
++        if ((size_t)frame.width * 2 == scanout_.width && (size_t)frame.height * 2 == scanout_.height) return twice(frame);
+         const size_t page = (size_t)getpagesize(), row = (size_t)frame.width * 4;
+         if (!frame.base || ((uintptr_t)frame.base & (page - 1)) || !frame.bytes || (frame.bytes & (page - 1)) ||
+             frame.width != scanout_.width || frame.height != scanout_.height || frame.stride < row ||
+@@ -148,6 +152,43 @@ public:
+         failed = state == nil;
+         return state != nil;
+     }
++    // uke macOS: one BGRA frame of half the scanout's size, every pixel doubled each way (kernel scanout_opaque_x2, alpha 0xff).
++    Result twice(const Frame &frame) {
++        const size_t page = (size_t)getpagesize(), row = (size_t)frame.width * 4;
++        if (!frame.base || ((uintptr_t)frame.base & (page - 1)) || !frame.bytes || (frame.bytes & (page - 1)) || frame.stride < row ||
++            (frame.stride & 3) || (scanout_.stride & 3) || (size_t)frame.height > frame.bytes / frame.stride ||
++            frame.stride * (frame.height - 1) + row > frame.bytes) return kBadFrame;
++        if (!x2Pipeline()) return kNoResource;
++        id<MTLBuffer> source = sourceFor(frame);
++        if (!source) return kNoResource;
++        id<MTLCommandBuffer> commands = [queue_ commandBuffer];
++        id<MTLComputeCommandEncoder> encoder = commands ? [commands computeCommandEncoder] : nil;
++        if (!encoder) return kNoResource;
++        const uint32_t params[4] = {scanout_.width, scanout_.height, (uint32_t)(frame.stride / 4), (uint32_t)(scanout_.stride / 4)};
++        [encoder setComputePipelineState:x2_];
++        [encoder setBuffer:source offset:0 atIndex:0];
++        [encoder setBuffer:target_ offset:0 atIndex:1];
++        [encoder setBytes:params length:sizeof params atIndex:3];
++        [encoder dispatchThreadgroups:MTLSizeMake((scanout_.width + 15) / 16, (scanout_.height + 7) / 8, 1) threadsPerThreadgroup:MTLSizeMake(16, 8, 1)];
++        [encoder endEncoding];
++        [commands commit];
++        [commands waitUntilCompleted];
++        return commands.status == MTLCommandBufferStatusCompleted ? kOk : kGpuFailed;
++    }
++    bool x2Pipeline() {
++        if (x2_ || x2Failed_) return x2_ != nil;
++        x2Failed_ = true;
++        if (!uke_scanout_x2_air || !native_bridge_metal_library_with_air) return false;
++        size_t length = 0;
++        const void *air = uke_scanout_x2_air(&length);
++        id<MTLLibrary> library = air && length ? native_bridge_metal_library_with_air(air, length) : nil;
++        id<MTLFunction> function = [library newFunctionWithName:@"scanout_opaque_x2"];
++        NSError *error = nil;
++        x2_ = function ? [device_ newComputePipelineStateWithFunction:function error:&error] : nil;
++        if (x2_ && x2_.maxTotalThreadsPerThreadgroup < 128) x2_ = nil;
++        x2Failed_ = x2_ == nil;
++        return x2_ != nil;
++    }
+     // The 8-bit code of every 16-bit half pattern, as 32-bit words (65536 of them, 256 KiB).
+     id<MTLBuffer> table(bool encoded) {
+         if (tables_[encoded]) return tables_[encoded];
+@@ -189,6 +230,8 @@ private:
+     id<MTLBuffer> target_;
+     id<MTLComputePipelineState> convert_ = nil, opaque_ = nil;
+     bool convertFailed_ = false, opaqueFailed_ = false;
++    id<MTLComputePipelineState> x2_ = nil;   // uke macOS: scanout_opaque_x2
++    bool x2Failed_ = false;
+     id<MTLBuffer> tables_[2] = {nil, nil};
+     Source sources_[kSources] = {};
+     uint64_t uses_ = 0;
 diff --git a/NativeAdrenoMetalPlugin.mm b/NativeAdrenoMetalPlugin.mm
-index 415e9c8..2459c4b 100644
+index 415e9c8..ac088a7 100644
 --- a/NativeAdrenoMetalPlugin.mm
 +++ b/NativeAdrenoMetalPlugin.mm
 @@ -8,6 +8,7 @@
@@ -10,7 +210,131 @@ index 415e9c8..2459c4b 100644
  #include "SharedShaderCache.h"
  #include <pthread.h>
  #include <thread>
-@@ -185,7 +186,7 @@ static id clientDevice(unsigned port) {
+@@ -51,6 +52,14 @@ static bool requestedPath(const char *name, char *path, size_t size) {
+     char *slash = strrchr(path, '/');          // the bundle's executable: <dir>/NativeAdrenoMetal.bundle/NativeAdrenoMetal
+     if (!slash) return false;
+     *slash = 0;
++#if TARGET_OS_OSX
++    // uke macOS: the executable is <dir>/NativeAdrenoMetal.bundle/Contents/MacOS/NativeAdrenoMetal; step out of Contents/MacOS too.
++    for (int up = 0; up < 2; ++up) {
++        slash = strrchr(path, '/');
++        if (!slash) return false;
++        *slash = 0;
++    }
++#endif
+     slash = strrchr(path, '/');
+     if (!slash) return false;
+     snprintf(slash + 1, size - size_t(slash + 1 - path), "%s", name);
+@@ -81,7 +90,7 @@ static bool readTask(uintptr_t address, void *out, size_t size) {
+     vm_size_t got = 0;
+     return vm_read_overwrite(mach_task_self(), address, size, (vm_address_t) out, &got) == KERN_SUCCESS && got == size;
+ }
+-static bool writeTask(uintptr_t address, const void *data, size_t size) {
++[[maybe_unused]] static bool writeTask(uintptr_t address, const void *data, size_t size) {
+     return vm_write(mach_task_self(), address, (vm_offset_t) data, (mach_msg_type_number_t) size) == KERN_SUCCESS;
+ }
+ // EXPERIMENT (second report onward): this display path takes plain 8-bit BGRA only, so tell the render server's display that it has neither the deep
+@@ -96,7 +105,26 @@ static bool bootArgSet(const char *key) {
+     size_t size = sizeof args - 1;
+     return sysctlbyname("kern.bootargs", args, &size, nullptr, 0) == 0 && strstr(args, key);
+ }
+-static unsigned patchFramebufferBranch(uintptr_t slide) {
++// uke macOS: which processes besides the render server get a native device (boot-arg uke-metal-clients=name1,name2,...; '*' = all).
++// Without it only WindowServer does: every other process keeps Metal without a device, as before the published mode, so Core Image
++// and Core Animation draw there on the CPU instead of through translation gaps (iconservicesagent's [[visible]] _asgDown kernels
++// left icons, the Dock, widgets and the wallpaper blank, 2026-11-07).
++static bool ukeMetalClientAllowed() {
++    char args[1100] = {};
++    size_t size = sizeof args - 1;
++    if (sysctlbyname("kern.bootargs", args, &size, nullptr, 0) != 0) return false;
++    const char *at = strstr(args, "uke-metal-clients=");
++    if (!at) return false;
++    char list[256] = {};
++    strlcpy(list, at + 18, sizeof list);
++    list[strcspn(list, " ")] = 0;
++    if (!strcmp(list, "*")) return true;
++    const char *self = getprogname();
++    for (char *save = nullptr, *name = strtok_r(list, ",", &save); name; name = strtok_r(nullptr, ",", &save))
++        if (!strcmp(name, self)) return true;
++    return false;
++}
++[[maybe_unused]] static unsigned patchFramebufferBranch(uintptr_t slide) {
+     const uintptr_t site = 0x184461928 + slide;
+     uint32_t word = 0;
+     if (!readTask(site, &word, sizeof word)) return 0x6E40;
+@@ -151,6 +179,71 @@ static void clientFailure(unsigned port, const char *step, const char *detail) {
+             }
+     }
+ }
++#if TARGET_OS_OSX
++// uke macOS render diagnostics (on unless the boot argument uke-metal-diag=0). Text, shadows and the translucent materials were missing
++// on the desktop while no refusal reached the log: the render server's own problems had no route to the kernel (only client devices set
++// native_bridge_metal_problem_hook), and the frontend's telemetry table (warnings, texture formats, surface refusals, pipeline counts) was
++// read by nothing on macOS. Each row goes through the process's text line (streamText -> UKE TXT), one at a time and 1.2 s apart, since
++// the kernel keeps each connection's latest row and samples it once a second.
++#include <mutex>
++#include <set>
++extern "C" size_t native_bridge_metal_telemetry(char *out, size_t size);
++namespace ukediag {
++static bool enabled() {static const bool on = !bootArgSet("uke-metal-diag=0"); return on;}
++static dispatch_queue_t queue() {
++    static dispatch_queue_t q = dispatch_queue_create("uke.metal.diag", DISPATCH_QUEUE_SERIAL);
++    return q;
++}
++static void send(Gpu *gpu, const std::string &row) {
++    if (!enabled() || !gpu) return;
++    std::string copy = row;
++    dispatch_async(queue(), ^{streamText(*gpu, copy.c_str()); usleep(1200000);});
++}
++// A long text as up to `parts` rows of 56 characters: "<tag> " then "<tag>+ " for the continuations.
++static void sendLong(Gpu *gpu, const char *tag, const char *text, unsigned parts) {
++    const size_t length = strlen(text);
++    for (unsigned part = 0; part < parts && part * 56 < length; ++part)
++        send(gpu, std::string(tag) + (part ? "+ " : " ") + std::string(text + part * 56).substr(0, 56));
++}
++// Each distinct problem once, the first 48 of a process.
++static void problem(Gpu *gpu, const char *text) {
++    static std::mutex lock;
++    static std::set<std::string> seen;
++    {
++        std::lock_guard<std::mutex> hold(lock);
++        if (seen.size() >= 48 || !seen.insert(text).second) return;
++    }
++    const char *shown = !strncmp(text, "native-metal: ", 14) ? text + 14 : text;
++    sendLong(gpu, "P", shown, 4);
++}
++// 40 s after the device opened and then every 60 s for 30 minutes: the status line (commits, pipelines, refusals, passes, draws, the
++// last two refusals) and the telemetry rows that say what the translator degraded (W), which texture formats were asked (F), which
++// surfaces were refused (SR), the pipeline makings (V) and the shader cache (SC).
++static void periodic(Gpu *gpu) {
++    if (!enabled() || !gpu) return;
++    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
++        static char table[8192];
++        sleep(40);
++        for (unsigned round = 0; round < 30; ++round) {
++            char status[400] = {};
++            native_bridge_metal_status(status, sizeof status);
++            sendLong(gpu, "S", status, 6);
++            const size_t n = native_bridge_metal_telemetry(table, sizeof table - 1);
++            table[n] = 0;
++            for (char *line = table; line && *line;) {
++                char *end = strchr(line, '\n');
++                if (end) *end = 0;
++                if (!strncmp(line, "W ", 2) || !strncmp(line, "Wb ", 3) || !strncmp(line, "F ", 2) || !strncmp(line, "SR ", 3) ||
++                    !strncmp(line, "V ", 2) || !strncmp(line, "SC ", 3))
++                    sendLong(gpu, "T", line, 2);
++                line = end ? end + 1 : nullptr;
++            }
++            sleep(60);
++        }
++    });
++}
++}  // namespace ukediag
++#endif
+ static id clientDevice(unsigned port) {
+     char turnip[1024];
+     if (!turnip::libraryPath(turnip, sizeof turnip) || access(turnip, R_OK) != 0) {clientFailure(port, "no-turnip", ""); return nil;}
+@@ -185,7 +278,7 @@ static id clientDevice(unsigned port) {
      }
      if (!device && !usable) {
          setenv("METAL2VULKAN_SHADER_CACHE_OPTIONAL", "1", 1);
@@ -19,7 +343,17 @@ index 415e9c8..2459c4b 100644
          @try {
              device = native_bridge_metal_open(turnip, path, registryID, nullptr);
          } @catch (NSException *exception) {
-@@ -241,6 +242,8 @@ static id deviceForPort(unsigned port) {
+@@ -203,6 +296,9 @@ static id clientDevice(unsigned port) {
+         native_bridge_metal_problem_hook = [](const char *problem) {clientFailure(gClientPort, "problem", problem);};
+         char problem[200] = {};
+         if (native_bridge_metal_first_problem(problem, sizeof problem) && problem[0]) clientFailure(port, "problem", problem);
++#if TARGET_OS_OSX
++        ukediag::periodic(makeGpu(port));
++#endif
+     }
+     return device;
+ }
+@@ -241,6 +337,8 @@ static id deviceForPort(unsigned port) {
          setenv("TU_DEBUG", bootArgSet("sheng-fb-bgra=1") ? "sysmem,nocb" : "nocb", 0);
          // sheng-diag=1 turns on every diagnostic of the GPU stack in this process: the frontend's frame trace, Turnip's pass stamps and
          // submission ring, the runtime's stage ring, and in the render server the status and telemetry lines. Without it none of them runs.
@@ -28,16 +362,16 @@ index 415e9c8..2459c4b 100644
          if (bootArgSet("sheng-diag=1") || bootArgSet("sheng-gpu-trace=1")) setenv("SHENG_DIAG", "1", 1);
          else unsetenv("SHENG_DIAG");
          if (bootArgSet("sheng-gpu-trace=1")) setenv("SHENG_GPU_TRACE", "1", 1);
-@@ -249,7 +252,7 @@ static id deviceForPort(unsigned port) {
+@@ -249,7 +347,7 @@ static id deviceForPort(unsigned port) {
          // log-gpu=1: the GPU stack's log lines (NSLog, the pipeline journal); off without it.
          if (bootArgSet("log-gpu=1")) setenv("SHENG_LOG_GPU", "1", 1);
          else unsetenv("SHENG_LOG_GPU");
 -        if (strcmp(getprogname(), "backboardd") != 0) return device = clientDevice(port);
-+        if (strcmp(getprogname(), UKE_RENDER_SERVER) != 0) return device = clientDevice(port);
++        if (strcmp(getprogname(), UKE_RENDER_SERVER) != 0) return device = ukeMetalClientAllowed() ? clientDevice(port) : nil;
          // The discovery releases the accelerator port when it is done; the monitor and the scanout client keep using it.
          if (void *iokit = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW | RTLD_LOCAL)) {
              if (auto retain = (int (*)(unsigned))dlsym(iokit, "IOObjectRetain")) retain(port);
-@@ -290,7 +293,7 @@ static id deviceForPort(unsigned port) {
+@@ -290,7 +388,7 @@ static id deviceForPort(unsigned port) {
          }
          // The render server compresses its framebuffer (an Apple/AGX layout this GPU does not write) unless told not to; the display driver takes plain rows.
          setenv("CA_DISABLE_FRAMEBUFFER_COMPRESSION", "1", 1);
@@ -46,7 +380,7 @@ index 415e9c8..2459c4b 100644
          // iPadOS 27 picks a 64-bit half-float framebuffer ('RGhA') whenever the display's EDR headroom is above 1 (this panel reports XDR
          // headroom), which the display path can only show converted, slowly and greyed. As on iPadOS 17, where the render server drew plain
          // 8-bit BGRA, the headroom is held at 1. IOMFBDisplay::framebuffer_pixel_format (24A446 0x184461838, asked on every update) takes
-@@ -314,7 +317,7 @@ static id deviceForPort(unsigned port) {
+@@ -314,7 +412,7 @@ static id deviceForPort(unsigned port) {
              gpu->mark(writeTask(0x1e7021104 + slide, &never, sizeof never) ? 0x6E02 : 0x6EF2);
              const uint8_t off = 0;
              gpu->mark(writeTask(0x1e702116c + 156 + slide, &off, sizeof off) ? 0x6E03 : 0x6EF3);
@@ -55,7 +389,7 @@ index 415e9c8..2459c4b 100644
              // What framebuffer_pixel_format reads in the render server, once the desktop has started (other processes draw no
              // framebuffer): 0x6E20 | 1 headroom override 1, 2 threshold above 1, 4 CA_FORCE_FP16_FRAMEBUFFER (_ca_debug_options
              // 0x1e702116c + 128), 8 CA_ALLOW_EDR_MIRRORING (+ 156), 0x10 the device-is-virtualized byte (0x1e701bdd9).
-@@ -325,7 +328,7 @@ static id deviceForPort(unsigned port) {
+@@ -325,7 +423,7 @@ static id deviceForPort(unsigned port) {
              static uintptr_t gSlide;
              gSlide = slide;
              pthread_t reader;
@@ -64,7 +398,7 @@ index 415e9c8..2459c4b 100644
                  sleep(30);
                  const float headroom = *reinterpret_cast<volatile const float *>(0x1e7021014 + gSlide);
                  const float threshold = *reinterpret_cast<volatile const float *>(0x1e7021104 + gSlide);
-@@ -362,7 +365,7 @@ static id deviceForPort(unsigned port) {
+@@ -362,7 +460,7 @@ static id deviceForPort(unsigned port) {
          // so with a persistent Data store the pipelines were still compiled again each boot (V row hit0). Try the user's Library/Caches first
          // (marker 0x6814); the earlier candidates keep their markers.
          if (const passwd *user = getpwuid(getuid()); user && user->pw_dir && user->pw_dir[0]) {
@@ -73,7 +407,50 @@ index 415e9c8..2459c4b 100644
              mkdir(candidates[4], 0700);
              strlcat(candidates[4], "/", sizeof candidates[4]);
          }
-@@ -441,7 +444,7 @@ static id deviceForPort(unsigned port) {
+@@ -385,6 +483,10 @@ static id deviceForPort(unsigned port) {
+                 const int imported = cacheexport::importPack(pack, candidates[i]);
+                 if (imported) gpu->mark(0x6C00 | (imported < 0 ? 0xff : imported > 0xfe ? 0xfe : imported));
+             }
++#if TARGET_OS_OSX
++            // What earlier boots compiled here, kept by the kernel in the DRV window (the Data volume is a RAM overlay).
++            (void)cacheexport::importKernel(*gpu, candidates[i]);
++#endif
+             @try {
+                 device = native_bridge_metal_open(turnip, candidates[i], registryID, nullptr);
+             } @catch (NSException *exception) {
+@@ -400,6 +502,17 @@ static id deviceForPort(unsigned port) {
+             return nil;
+         }
+         gpu->mark(0x6802);
++#if TARGET_OS_OSX
++        // The render server's problems and telemetry into the log (ukediag above).
++        {
++            static Gpu *diagGpu;
++            diagGpu = gpu;
++            native_bridge_metal_problem_hook = [](const char *problem) {ukediag::problem(diagGpu, problem);};
++            char problem[200] = {};
++            if (native_bridge_metal_first_problem(problem, sizeof problem) && problem[0]) ukediag::problem(gpu, problem);
++            ukediag::periodic(gpu);
++        }
++#endif
+         // The display hand-off client on its own thread: it only serves, not the discovery.
+         pthread_t scanout;
+         pthread_attr_t attributes;
+@@ -419,8 +532,13 @@ static id deviceForPort(unsigned port) {
+         // The cache directory's export to the UFS log only when NativeAdrenoMetal.cacheexport sits beside the bundle: Data persists across
+         // boots now, so the caches no longer need the trip through the host, and once priming has filled the directory, every rescan and
+         // export competed with the render server (int-245: the scanning thread at 45% CPU, the sending one at 48%, frames twice as slow).
++#if TARGET_OS_OSX
++        // uke macOS: always, into the kernel's persistent DRV slots (the Data volume does not persist here).
++        if (true) {
++#else
+         char exportPath[1024];
+         if (requestedPath("NativeAdrenoMetal.cacheexport", exportPath, sizeof exportPath)) {
++#endif
+             pthread_t exporter;
+             pthread_create(&exporter, &attributes, [](void *arg) -> void * {
+                 cacheexport::run(*static_cast<Gpu *>(arg), gCacheDirectory);
+@@ -441,7 +559,7 @@ static id deviceForPort(unsigned port) {
          pthread_attr_destroy(&attributes);
          // The GMEM colour order test (NativeTurnipSwapTest.h), once, 20 s after the device is published: each result line goes to the
          // kernel's GPU trace as a problem record (event 65).
@@ -82,7 +459,7 @@ index 415e9c8..2459c4b 100644
              pthread_t tester;
              pthread_create(&tester, nullptr, [](void *) -> void * {
                      sleep(20);
-@@ -497,7 +500,7 @@ - (id)initWithAcceleratorPort:(unsigned)port {
+@@ -497,7 +615,7 @@ - (id)initWithAcceleratorPort:(unsigned)port {
                  auto matching = (void *(*)(const char *))dlsym(iokit, "IOServiceMatching");
                  auto getService = (unsigned (*)(unsigned, void *))dlsym(iokit, "IOServiceGetMatchingService");
                  if (matching && getService) {
@@ -92,7 +469,7 @@ index 415e9c8..2459c4b 100644
                  }
              }
 diff --git a/NativeBridgeMetalFrontend.mm b/NativeBridgeMetalFrontend.mm
-index 6510f3d..2c0c723 100644
+index 6510f3d..7837edc 100644
 --- a/NativeBridgeMetalFrontend.mm
 +++ b/NativeBridgeMetalFrontend.mm
 @@ -6,6 +6,7 @@
@@ -121,7 +498,16 @@ index 6510f3d..2c0c723 100644
   if(!diagOn() || !render)return;
   bool expected=false;
   if(!gTraceStarted.compare_exchange_strong(expected,true))return;
-@@ -540,7 +541,7 @@ static void noteProblem(NSString *what) {
+@@ -499,6 +500,8 @@ static bool harmlessProblem(NSString *what) {
+  for(NSString *prefix in @[@"native-metal: no device answer",@"native-metal: setGPUPriority",@"native-metal: setBackgroundGPUPriority",
+                            @"native-metal: binary archive refused",@"native-metal: texture layouts are"])
+   if([what hasPrefix:prefix])return true;
++ // uke macOS: Metal hands every new device its IOKit service (-[MTLIOAccelDevice _setAcceleratorService:], a setter); answered nil, nothing drawn changes.
++ if([what hasPrefix:@"missing "] && [what containsString:@"_setAcceleratorService:"])return true;
+  return false;
+ }
+ static void noteProblem(NSString *what) {
+@@ -540,7 +543,7 @@ static void noteProblem(NSString *what) {
  // the display shows the surfaces it composed last until backboardd restarts (the hang's evidence is in the host's KGSL log
  // and the context's loss mask, not here). End it once its completed handlers have seen the error; launchd starts it
  // again, SpringBoard with it, and the screen comes back at the lock screen. Other clients get AccessRevoked and decide.
@@ -130,7 +516,7 @@ index 6510f3d..2c0c723 100644
  static void endRenderServerAfterGpuLoss() {
   static std::atomic<bool> ending{false};
   if(!isRenderServer() || ending.exchange(true))return;
-@@ -908,7 +909,7 @@ - (void)replacePvrtcRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level slice:(NSU
+@@ -908,7 +911,7 @@ - (void)replacePvrtcRegion:(MTLRegion)r mipmapLevel:(NSUInteger)level slice:(NSU
  - (void)countUse;
  @end
  // The render server counts the surfaces it textures in use while the textures live (countUse).
@@ -139,6 +525,130 @@ index 6510f3d..2c0c723 100644
  // A no-copy import keeps its pages until the runtime frees it, which can be after the buffer object goes (a command buffer still using
  // it). The owner's release (Metal's deallocator, an IOSurface's mapping) waits for that, as Metal's does: run earlier, the owner could
  // unmap or reuse pages the GPU still reads or writes.
+@@ -3999,6 +4002,10 @@ - (NSString *)newDagStringWithGraphs:(NSArray<MTLFunctionStitchingGraph *> *)gra
+ @end
+ @interface NBDeviceMethods : NSObject
+ @end
++#if TARGET_OS_OSX
++// uke macOS: the runtime's own minimumLinearTextureAlignmentForPixelFormat: (installAnswers keeps it here before raising the answer).
++static NSUInteger (*gLinearAlignmentAnswer)(id,SEL,NSUInteger);
++#endif
+ @implementation NBDeviceMethods
+ - (NSString *)name {return gName;}
+ // MPSCore reads the GPU core count of every Apple GPU family (no count: no MPS device, and its image cache is nil); the Adreno's
+@@ -4011,9 +4018,31 @@ - (NSUInteger)minimumTextureBufferAlignmentForPixelFormat:(NSUInteger)format {
+ // SPI: the row alignment a read-only texture over an IOSurface needs. Answered unasked it was 0 (a divisor for its callers); the linear
+ // texture alignment of the widest common format is the same rule this GPU applies to any linear image.
+ - (NSUInteger)iosurfaceReadOnlyTextureAlignmentBytes {
++#if TARGET_OS_OSX
++ // Kept at the runtime's own answer: Snapintosh found a 64-byte IOSurface alignment sent Core Image's blur into MPS with a nil source.
++ SEL linear=sel_registerName("minimumLinearTextureAlignmentForPixelFormat:");
++ if(gLinearAlignmentAnswer)return gLinearAlignmentAnswer(self,linear,MTLPixelFormatRGBA16Float);
++#endif
+  return ((NSUInteger (*)(id,SEL,NSUInteger))objc_msgSend)(self,sel_registerName("minimumLinearTextureAlignmentForPixelFormat:"),MTLPixelFormatRGBA16Float);
+ }
+ - (uint64_t)registryID {return gRegistryID;}
++#if TARGET_OS_OSX
++// uke macOS: CoreDisplay::FindAcceleratorWithMTLDevice takes the panel's accelerator from -[MTLDevice acceleratorPort]. The default answer
++// (0) gave the display accelerator 0, and SkyLight's WSGetCompositorForAccelerator then chose its software compositor: WindowServer drew
++// the desktop on the CPU and used the GPU only for the scanout copy (render diag rows R0 D0, 2026-11-07). The port is the accelerator
++// service this device was opened for, found once by its registry ID.
++- (unsigned)acceleratorPort {
++ static unsigned port;
++ static dispatch_once_t once;
++ dispatch_once(&once,^{
++  void *iokit=dlopen("/System/Library/Frameworks/IOKit.framework/IOKit",RTLD_NOW|RTLD_LOCAL);
++  auto idMatching=iokit?(CFMutableDictionaryRef (*)(uint64_t))dlsym(iokit,"IORegistryEntryIDMatching"):nullptr;
++  auto matchingService=iokit?(unsigned (*)(unsigned,CFDictionaryRef))dlsym(iokit,"IOServiceGetMatchingService"):nullptr;
++  if(idMatching && matchingService && gRegistryID)port=matchingService(0,idMatching(gRegistryID));
++ });
++ return port;
++}
++#endif
+ - (NSUInteger)maxBufferLength {return nmb_device_max_buffer_length(gDevice);}
+ - (BOOL)hasUnifiedMemory {return YES;}
+ - (BOOL)respondsToSelector:(SEL)selector {
+@@ -4183,6 +4212,23 @@ - (id)newTextureLayoutWithDescriptor:(MTLTextureDescriptor *)d isHeapOrBufferBac
+  if(!page || (page&(page-1)) || !base || ((uintptr_t)base&(page-1)) || !allocation || allocation>SIZE_MAX-(page-1)){refuseSurface(2,surface,d,plane,(uintptr_t)base,0);return nil;}
+  uintptr_t start=planes?(uintptr_t)IOSurfaceGetBaseAddressOfPlane(surface,plane):(uintptr_t)base;
+  size_t row=planes?IOSurfaceGetBytesPerRowOfPlane(surface,plane):IOSurfaceGetBytesPerRow(surface);
++#if TARGET_OS_OSX
++ // uke macOS: Apple's lossless-compressed spellings of a plain surface ('&BGA' BGRA8 for Control Center's layers, '&RhA' RGBA16F for
++ // Notification Center's widgets and WindowServer) hold 16x16 compressed tiles on Apple GPUs; this GPU neither writes nor reads that
++ // layout, so every process that shares such a surface uses it as plain linear rows of width x bytes per pixel aligned to 64 bytes,
++ // as Snapintosh's Adreno driver does (AdrenoCompressedSurfaceRow, its v29 and v69), instead of the tile layout's plane rows.
++ {
++  const OSType fourcc=IOSurfaceGetPixelFormat(surface);
++  size_t cpp=0;
++  if(fourcc==0x26424741 /* '&BGA' */ && (d.pixelFormat==MTLPixelFormatBGRA8Unorm || d.pixelFormat==MTLPixelFormatBGRA8Unorm_sRGB))cpp=4;
++  if(fourcc==0x26526841 /* '&RhA' */ && d.pixelFormat==MTLPixelFormatRGBA16Float)cpp=8;
++  if(cpp && planes<=1 && plane==0 && d.textureType==MTLTextureType2D && d.mipmapLevelCount==1 && d.width && d.height &&
++     d.width<=IOSurfaceGetWidth(surface) && d.height<=IOSurfaceGetHeight(surface)) {
++   const size_t linear=(IOSurfaceGetWidth(surface)*cpp+63)&~(size_t)63;
++   if((uint64_t)linear*IOSurfaceGetHeight(surface)<=allocation-(start-(uintptr_t)base))row=linear;
++  }
++ }
++#endif
+  size_t computed[4];   // myron: a 'b3a8' surface without plane rows
+  if(!row && plane<2 && b3a8Planes(surface,allocation,computed)){start=(uintptr_t)base+computed[plane*2];row=computed[plane*2+1];}
+  if(start<(uintptr_t)base || start-(uintptr_t)base>=allocation || !row){refuseSurface(3,surface,d,plane,start-(uintptr_t)base,row);return nil;}
+@@ -4534,8 +4580,27 @@ static void installCoreImageResourceFallback() {
+ static void installCoreImageResourceFallback() {}
+ #endif
+ 
++#if TARGET_OS_OSX
++// uke macOS: the device presents itself as a non-Apple Mac GPU, as Snapintosh's Adreno driver does (featureProfile 10001: Mac2 +
++// Common1-3, no Apple family, no function pointers or dynamic libraries, no SIMD-group operations). With Apple families and function
++// pointers Core Image took its Apple-GPU paths (ci_filters_stitchable's [[stitchable]] functions stitched and linked into render
++// pipelines), which the translator refuses: icons, the Dock, widgets and the wallpaper stayed blank (2026-11-07). Boot-arg
++// uke-metal-apple=1 keeps the measured (Apple) answers.
++static bool ukeMacProfile() {
++ static int on=-1;
++ if(on<0) {
++  char args[1100]={};size_t size=sizeof args-1;
++  on=!(sysctlbyname("kern.bootargs",args,&size,nullptr,0)==0 && strstr(args,"uke-metal-apple=1"));
++ }
++ return on!=0;
++}
++#endif
+ static BOOL familyForCaller(id self,SEL _cmd,NSInteger family) {
+  installCoreImageResourceFallback();
++#if TARGET_OS_OSX
++ if(ukeMacProfile())
++  return family==MTLGPUFamilyCommon1 || family==MTLGPUFamilyCommon2 || family==MTLGPUFamilyCommon3 || family==MTLGPUFamilyMac2;
++#endif
+  if(family>=1003 && family<2000) {   // MTLGPUFamilyApple3 and up
+   Dl_info caller;
+   if(dladdr(__builtin_return_address(0),&caller) && caller.dli_fname && strstr(caller.dli_fname,"/RenderBox.framework/"))return NO;
+@@ -4564,6 +4629,28 @@ static void installAnswers(Class cls) {
+   gFamilyAnswer=(BOOL (*)(id,SEL,NSInteger))method_getImplementation(family);
+   method_setImplementation(family,(IMP)familyForCaller);
+  }
++#if TARGET_OS_OSX
++ // uke macOS: the non-Apple Mac profile (ukeMacProfile) withholds what Core Image and Metal use to pick Apple-GPU paths.
++ if(ukeMacProfile())
++  for(const char *name:{"supportsFunctionPointers","supportsFunctionPointersFromRender","supportsDynamicLibraries",
++                         "supportsRenderDynamicLibraries","supportsRaytracing","supportsRaytracingFromRender","supportsPrimitiveMotionBlur",
++                         "supportsSIMDGroup","supportsSIMDReduction","supportsSIMDShuffleAndFill","supportsSIMDGroupMatrix",
++                         "supportsQuadGroup","supportsTileShaders","supportsImageBlocks"}) {
++   SEL sel=sel_registerName(name);
++   gAnswers[sel]=0;
++   if(!class_addMethod(cls,sel,(IMP)flagAnswer,"B16@0:8"))class_replaceMethod(cls,sel,(IMP)flagAnswer,"B16@0:8");
++  }
++ // uke macOS: linear textures (over buffers, and Core Image's RGBA16F intermediates sized from this answer) get 64-byte row
++ // alignment, the Adreno's linear pitch alignment, as Snapintosh answers (its v80); the runtime's 16 stays its own floor.
++ if(ukeMacProfile())
++  if(Method linear=class_getInstanceMethod(cls,sel_registerName("minimumLinearTextureAlignmentForPixelFormat:"))) {
++   gLinearAlignmentAnswer=(NSUInteger (*)(id,SEL,NSUInteger))method_getImplementation(linear);
++   method_setImplementation(linear,imp_implementationWithBlock(^NSUInteger(id self,NSUInteger format) {
++    const NSUInteger own=gLinearAlignmentAnswer(self,sel_registerName("minimumLinearTextureAlignmentForPixelFormat:"),format);
++    return own>64?own:64;
++   }));
++  }
++#endif
+ }
+ 
+ extern "C" id native_bridge_metal_open(const char *loader,const char *cache,uint64_t registryID,void (*missing)(const char *,const char *)) {
 diff --git a/NativeTurnipSmoke.h b/NativeTurnipSmoke.h
 index 4d17e26..009aec0 100644
 --- a/NativeTurnipSmoke.h

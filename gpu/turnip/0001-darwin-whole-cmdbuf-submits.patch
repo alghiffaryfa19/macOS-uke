@@ -1,0 +1,54 @@
+diff --git a/src/freedreno/vulkan/tu_knl_darwin.cc b/src/freedreno/vulkan/tu_knl_darwin.cc
+--- a/src/freedreno/vulkan/tu_knl_darwin.cc
++++ b/src/freedreno/vulkan/tu_knl_darwin.cc
+@@ -1153,6 +1153,7 @@
+ 
+ struct tu_darwin_queue_submit {
+    struct util_dynarray commands; /* NativeAdrenoAbiSubmitBuffer */
++   struct util_dynarray groups;   /* unsigned: index in commands where each add_entries call (a command buffer) starts */
+ };
+ 
+ static void *
+@@ -1167,6 +1168,7 @@
+ {
+    struct tu_darwin_queue_submit *submit = (struct tu_darwin_queue_submit *)_submit;
+    util_dynarray_fini(&submit->commands);
++   util_dynarray_fini(&submit->groups);
+    vk_free(&device->vk.alloc, submit);
+ }
+ 
+@@ -1175,6 +1177,8 @@
+                           struct tu_cs_entry *entries, unsigned num_entries)
+ {
+    struct tu_darwin_queue_submit *submit = (struct tu_darwin_queue_submit *)_submit;
++   util_dynarray_append_typed(&submit->groups, unsigned,
++                        (unsigned)util_dynarray_num_elements(&submit->commands, NativeAdrenoAbiSubmitBuffer));
+    NativeAdrenoAbiSubmitBuffer *cmds = (NativeAdrenoAbiSubmitBuffer *)
+       util_dynarray_grow(&submit->commands, NativeAdrenoAbiSubmitBuffer, num_entries);
+    for (unsigned i = 0; i < num_entries; i++) {
+@@ -1487,8 +1491,23 @@
+    if (total) {
+       const NativeAdrenoAbiSubmitBuffer *all =
+          util_dynarray_element(&submit->commands, NativeAdrenoAbiSubmitBuffer, 0);
+-      for (unsigned at = 0; at < total; at += NativeAdrenoAbiMaxBuffers) {
+-         unsigned count = MIN2(total - at, (unsigned)NativeAdrenoAbiMaxBuffers);
++      /* uke (ported from the iPadOS 17 fix, 2026-10-30): each kernel submission starts both CP threads afresh (its prologue ends
++       * in CP_THREAD_CONTROL(BOTH)). Cut between command buffers, which set their threads themselves, so a split never wakes BV in
++       * the middle of BR's work: on macOS the CP sat with BV at CP_THREAD_CONTROL and BR stopped for 20-27 s whenever apps used the
++       * GPU (log M2v 2026-11-07). Only a command buffer longer than NativeAdrenoAbiMaxBuffers is still cut inside. */
++      const unsigned group_count = util_dynarray_num_elements(&submit->groups, unsigned);
++      const unsigned *groups = group_count ? util_dynarray_element(&submit->groups, unsigned, 0) : NULL;
++      unsigned next_group = 0;
++      for (unsigned at = 0, count; at < total; at += count) {
++         unsigned end = MIN2(total, at + (unsigned)NativeAdrenoAbiMaxBuffers);
++         while (next_group < group_count && groups[next_group] <= at)
++            next_group++;
++         unsigned last_cut = at;
++         for (unsigned g = next_group; g < group_count && groups[g] <= end; g++)
++            last_cut = groups[g];
++         if (end < total && last_cut > at)
++            end = last_cut;
++         count = end - at;
+          uint32_t chunk_fence = 0;
+          VkResult result = darwin_submit_chunk(queue, all + at, count, &chunk_fence, &rec);
+          if (result != VK_SUCCESS)

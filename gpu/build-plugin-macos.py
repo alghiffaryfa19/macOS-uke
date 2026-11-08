@@ -93,8 +93,14 @@ def main():
     shutil.copytree((TREE / 'drivers/AdrenoMetal').resolve(), src, ignore=shutil.ignore_patterns('.git', 'tools'))
     (OUT / 'drivers/GopFramebuffer').symlink_to((TREE / 'drivers/GopFramebuffer').resolve())
     patches = sorted((HERE / 'plugin').glob('[0-9][0-9][0-9][0-9]-*.patch'))
+    # src lies inside the UniXNU-a27 git repository: a plain `git apply` there resolves paths from that repository's top,
+    # prints "Skipped patch" and still exits 0, so the 2026-11-06 bundle shipped unpatched (backboardd, IOAcceleratorES;
+    # Turnip found no device on macOS, log M2k 2026-11-07). GIT_DIR=/dev/null makes it a plain patch tool in src.
+    env = dict(os.environ, GIT_DIR='/dev/null')
     for patch in patches:
-        run(['git', 'apply', '--whitespace=nowarn', patch], cwd=src)
+        subprocess.run(['git', 'apply', '--whitespace=nowarn', '--verbose', str(patch)], cwd=src, env=env, check=True)
+    if patches and not (src / 'UkeRenderServer.h').is_file():
+        sys.exit('plugin/*.patch did not apply (UkeRenderServer.h missing)')
     source_hash = hashlib.sha256()
     for path in sorted(src.rglob('*')):
         if path.is_file() and path.suffix in ('.h', '.mm', '.cpp', '.rs', '.patch'):
@@ -118,6 +124,22 @@ def main():
         run(['xcrun', 'clang++', *base[2:], '-std=c++17', '-fobjc-arc', '-Wno-deprecated-declarations', *include,
              '-x', 'objective-c++', '-c', src / (name + '.mm'), '-o', obj])
         objects.append(obj)
+    # uke: the GPU scanout's 2x kernel (plugin/scanout_x2.ll, hand-written AIR like shaders/scanout_convert.ll), assembled here
+    # and linked in as bytes: the compositor draws half the panel (native-gop-scale=2) and the GPU doubles it into the scanout.
+    llvm_as = next((p for p in ['/opt/homebrew/opt/llvm/bin/llvm-as', shutil.which('llvm-as') or ''] if p and Path(p).exists()), None)
+    if not llvm_as:
+        sys.exit('llvm-as is required for plugin/scanout_x2.ll')
+    x2_air = OUT / 'scanout_x2.air'
+    run([llvm_as, '-o', x2_air, HERE / 'plugin/scanout_x2.ll'])
+    x2_bytes = x2_air.read_bytes()
+    x2_c = OUT / 'UkeScanoutX2Air.c'
+    x2_c.write_text('#include <stddef.h>\n'
+                    'static const unsigned char kAir[%d] __attribute__((aligned(16))) = {%s};\n'
+                    'const void *uke_scanout_x2_air(size_t *length) {if (length) *length = sizeof kAir; return kAir;}\n'
+                    % (len(x2_bytes), ','.join(str(b) for b in x2_bytes)))
+    x2_obj = OUT / 'UkeScanoutX2Air.o'
+    run([*base, '-std=c11', '-c', x2_c, '-o', x2_obj])
+    objects.append(x2_obj)
     print('objects: plugin, frontend, PM4 and PAC boundary compile for arm64e macOS 26.5 (%d patches)' % len(patches))
     if args.objects_only:
         return

@@ -1,0 +1,137 @@
+--- a/drivers/Adreno740/NativeAdrenoVm.h
++++ b/drivers/Adreno740/NativeAdrenoVm.h
+@@ -72,6 +72,7 @@
+     unsigned budget_=0;
+     uint64_t next_handle_=1;
+     bool attached_=false,poisoned_=false,distrust_write_combined_=false,unusable_=false;
++    uint32_t audit_submissions_=0;
+     uint64_t faults_=0,hangs_=0;
+     bool fault_streams_=true;   /* a failure faults the bank's streams; off for a process table, whose streams are the kernel table's too */
+     NativeAdrenoVmResult result_{};
+@@ -123,6 +124,16 @@
+      * like any other (sticky; the safe behaviour of int-070..097). */
+     void distrustWriteCombined() {distrust_write_combined_=true;}
+     bool writeCombinedTrusted() const {return !distrust_write_combined_;}
++    /* uke: the write-combine audit runs on the first 16 submissions of each VM (it was the first 16 of the whole GPU, so a process that
++     * started later was never audited: log M2z, iconservicesagent's IB read as zeros by the CP). */
++    bool auditDue() {return audit_submissions_<16 && ++audit_submissions_;}
++    /* uke: writes back and invalidates the CPU lines over [iova, iova+bytes) of one mapped BO through its physical pages, whatever its
++     * attribute (a command buffer must be in DRAM before the CP fetches it: the CP reads IBs non-cacheable). */
++    IOReturn publishRange(uint64_t iova,size_t bytes) const;
++    /* uke diagnostics: the word at iova as the GPU reads it (table walk, then DRAM; false when no leaf or no DRAM read) and what kind of
++     * BO holds it: bit 0 system memory, 1 write-combined, 2 imported, 3 has a kernel mapping, 4 coherent mapping, 5 none found. */
++    bool gpuWord(uint64_t iova,uint32_t *word) const;
++    unsigned kindAt(uint64_t iova) const;
+     /* After a submission completed: cleans and invalidates the CPU caches over every GPU-writable imported BO, so the owner's mapping
+      * (an IOSurface) reads what the GPU wrote, not a line prefetched while the GPU ran. Jobs name only their IBs, so every such BO
+      * is covered. int-071: an imported render target read back 672 of 4096 texels stale. */
+--- a/drivers/Adreno740/NativeAdrenoVm.cpp
++++ b/drivers/Adreno740/NativeAdrenoVm.cpp
+@@ -446,7 +446,37 @@
+         if(m.memory->publishForDevice(0,m.memory->bytes(),true,distrust_write_combined_,NativeAdrenoPhaseSubmit))return fail(ArmSmmu4KIoError);
+     }
+     return kIOReturnSuccess;
++}
++IOReturn NativeAdrenoVm::publishRange(uint64_t iova,size_t bytes) const
++{
++    if(!attached_ || poisoned_)return kIOReturnNotReady;
++    for(size_t i=0;i<high_;++i) {
++        const Mapping &m=mappings_[i];
++        if(!m.memory || iova<m.iova || iova-m.iova>=m.memory->bytes())continue;
++        if(coherentMapping(m.writeback))return kIOReturnSuccess;
++        const size_t first=(size_t)(iova-m.iova)&~(size_t)4095;
++        size_t end=((size_t)(iova-m.iova)+bytes+4095)&~(size_t)4095;
++        if(end>m.memory->bytes())end=m.memory->bytes();
++        return m.memory->publishForDevice(first,end-first,true,true,NativeAdrenoPhaseSubmit);
++    }
++    return kIOReturnBadArgument;
++}
++bool NativeAdrenoVm::gpuWord(uint64_t iova,uint32_t *word) const
++{
++    uint64_t d=0;unsigned level=0;
++    const uint64_t pa=walkDiag(iova,&d,&level);
++    return pa && native_adreno_dram_read32 && !native_adreno_dram_read32(pa,word);
+ }
++unsigned NativeAdrenoVm::kindAt(uint64_t iova) const
++{
++    for(size_t i=0;i<high_;++i) {
++        const Mapping &m=mappings_[i];
++        if(!m.memory || iova<m.iova || iova-m.iova>=m.memory->bytes())continue;
++        return (m.memory->system()?1u:0u)|(m.memory->writeCombined()?2u:0u)|(m.memory->imported()?4u:0u)|
++            (m.memory->mapping()?8u:0u)|(coherentMapping(m.writeback)?16u:0u);
++    }
++    return 32u;
++}
+ IOReturn NativeAdrenoVm::acquireImported()
+ {
+     if(!attached_ || poisoned_)return kIOReturnNotReady;
+--- a/drivers/Adreno740/NativeAdrenoSubmit.cpp
++++ b/drivers/Adreno740/NativeAdrenoSubmit.cpp
+@@ -37,6 +37,16 @@
+  * the leaf descriptor (lo, hi), the level it was read at, the physical address it translates to (lo, hi) [8..14], [15..21]; [22] the
+  * ring table the ring installs last (lo of TTBR0), [23] ASID of that table. native_adreno_stall_ib2 holds 17 words at the BR IB2 fetch
+  * address as native_adreno_stall_mem holds the others. */
++/* uke: IB ranges written back before submission: [0] ranges, [1] bytes, [2] the last failure. */
++extern "C" {volatile uint32_t native_uke_ib_publish[3];}
++/* uke: each IB's first word as the GPU reads it from DRAM, before the submission's cache maintenance and after: [0] IBs checked, [1] zero
++ * before, [2] zero before and not after (it was in a CPU cache), [3] still zero after (the pages the GPU maps never got it), [4] BO kind
++ * (NativeAdrenoVm::kindAt) of the first [2] case, [5] its pid, [6] its iova (lo), [7] kind of the first [3] case, [8] its pid, [9] its iova
++ * (lo), [10] its size in bytes, [11] IBs whose word could not be read. boot-arg uke-gpu-wc-distrust=1: every VM maintains its
++ * write-combined BOs on every submission (no trust in write-combining). */
++extern "C" {volatile uint32_t native_uke_ib_zero[12];}
++extern "C" int proc_selfpid(void);
++extern "C" boolean_t PE_parse_boot_argn(const char *,void *,int);
+ extern "C" {volatile uint32_t native_adreno_stall_job[24];volatile uint32_t native_adreno_stall_ib2[17];}
+ /* Also at the snapshot: [0] the first ring index, then 48 ring words from 32 before the read pointer; each thread's SQE PC and packet
+  * (BR pc, BR packet, BV pc, BV packet); and the BR IB1 window of native_adreno_stall_mem read as the GPU translates it: [0] its first
+@@ -438,6 +448,13 @@
+      * IB sat in a CPU cache. While write-combined BOs are trusted, every line of this submission's IBs is compared as a CPU cache and
+      * DRAM hold it (bounded). A dirty line means a client view still caches its BOs: maintain every BO from now on, this submission
+      * included (the audit already wrote the IB lines back; the rest of the BOs may hold more). */
++    static int wc_distrust=-1;
++    if(wc_distrust<0) {unsigned v=0;PE_parse_boot_argn("uke-gpu-wc-distrust",&v,sizeof v);wc_distrust=v?1:0;}
++    if(wc_distrust && vm_->writeCombinedTrusted())vm_->distrustWriteCombined();
++    enum {UkeIbCheck=32};
++    uint32_t ib_before[UkeIbCheck];
++    bool ib_read[UkeIbCheck];
++    for(size_t i=0;i<count && i<UkeIbCheck;++i)ib_read[i]=vm_->gpuWord(buffers[i].iova,&ib_before[i]);
+     if(vm_->writeCombinedTrusted()) {
+         /* int-100: the dirty IB page was back at XNU's default (cacheable) attribute. Write-combine every such page again first; the
+          * pmap writes its lines back on the way, so the audit below should then find none. */
+@@ -449,7 +466,7 @@
+          * 133798 nor in i566's 2765132 (1358 audits of every eighth submission, about 2 ms each under the publish lock, so every eighth
+          * frame of every client waited), so only the first 16 submissions are compared now. */
+         ++audit_tick_;
+-        const bool audit_now=audit_tick_<=16;
++        const bool audit_now=vm_->auditDue();
+         if(!audit_now)budget=0;
+         for(size_t i=0;i<count && budget && !audited;++i) {   /* a failed re-assertion skips the audit and ends the trust */
+             const size_t bytes=buffers[i].bytes<budget?(size_t)buffers[i].bytes:budget;
+@@ -473,6 +490,27 @@
+     const bool sample=!(coherence_turn++&63);
+     if(sample)(void)vm_->sampleWord(buffers[0].iova,&cached,&before);
+     IOReturn status=vm_->publishMapped();
++    /* uke: every IB's own lines reach DRAM before the write pointer moves (Snapintosh cleans each packet to PoC before its doorbell). */
++    for(size_t i=0;i<count && !status;++i) {
++        const IOReturn published=vm_->publishRange(buffers[i].iova,(size_t)buffers[i].bytes);
++        native_uke_ib_publish[0]=native_uke_ib_publish[0]+1;native_uke_ib_publish[1]=native_uke_ib_publish[1]+(uint32_t)buffers[i].bytes;
++        if(published)native_uke_ib_publish[2]=(uint32_t)published;
++    }
++    for(size_t i=0;i<count && i<UkeIbCheck && !status;++i) {
++        volatile uint32_t *z=native_uke_ib_zero;
++        uint32_t after=0;
++        if(!ib_read[i] || !vm_->gpuWord(buffers[i].iova,&after)) {z[11]=z[11]+1;continue;}
++        z[0]=z[0]+1;
++        if(ib_before[i])continue;
++        z[1]=z[1]+1;
++        if(after) {
++            if(!z[2]) {z[4]=vm_->kindAt(buffers[i].iova);z[5]=(uint32_t)proc_selfpid();z[6]=(uint32_t)buffers[i].iova;}
++            z[2]=z[2]+1;
++        } else {
++            if(!z[3]) {z[7]=vm_->kindAt(buffers[i].iova);z[8]=(uint32_t)proc_selfpid();z[9]=(uint32_t)buffers[i].iova;z[10]=(uint32_t)buffers[i].bytes;}
++            z[3]=z[3]+1;
++        }
++    }
+     if(!status && sample) {
+         (void)vm_->sampleWord(buffers[0].iova,&ignored,&after);
+         native_adreno_coherence[0]=native_adreno_coherence[0]+1;

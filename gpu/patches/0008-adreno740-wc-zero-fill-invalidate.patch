@@ -1,0 +1,53 @@
+--- a/drivers/Adreno740/NativeAdrenoMemory.cpp
++++ b/drivers/Adreno740/NativeAdrenoMemory.cpp
+@@ -115,6 +115,8 @@
+      * as success. No object has been exposed to a GPU or userspace yet. */
+     (void)release();return status;
+ }
++/* uke: system write-combined BOs whose zero fill was written back and invalidated at allocation: [0] BOs, [1] 4 KiB pages. */
++extern "C" {volatile uint32_t native_uke_wc_zero_fill[2];}
+ /* No task: the memory is mapped nowhere until a client view maps it. The cache mode is the memory entry's, so every mapping of it (the
+  * client views) and the pages themselves take it. */
+ static IOBufferMemoryDescriptor *systemDescriptor(size_t bytes,bool write_combined,uint64_t *made=nullptr,uint64_t *wired=nullptr)
+@@ -162,8 +164,12 @@
+     if(!made)made=wired=mach_absolute_time();   /* a contiguous run: made and wired in one step */
+     if(descriptor->getLength()!=NativeAdrenoRoundCpuPage(bytes)) {descriptor->complete();descriptor->release();return kIOReturnUnsupported;}
+     bool cleaned=false;
+-    /* Default-attribute pages may still hold the zero fill in a CPU's cache: written back here, by physical runs, as allocateSystem would. */
+-    if(!write_combined) {
++    /* Default-attribute pages may still hold the zero fill in a CPU's cache: written back here, by physical runs, as allocateSystem would.
++     * uke: write-combined pages too, cleaned and invalidated. On macOS the zero fill of a new pageable write-combined page can stay in a
++     * CPU cache as dirty lines; the client then writes its commands straight to DRAM and the late eviction of those zeros lands on top
++     * (log M31: the first IB of every process, 0x100034000 in a system write-combined BO, read as zero by the GPU before and after the
++     * submission's maintenance; M2y: its first words zero, its end intact). */
++    {
+         cleaned=true;
+         for(size_t offset=0;offset<bytes && cleaned;) {
+             IOByteCount length=0;
+@@ -171,7 +177,8 @@
+             if(!physical || (physical&4095) || length<4096) {cleaned=false;break;}
+             if(length>bytes-offset)length=bytes-offset;
+             length&=~IOByteCount(4095);
+-            if(NativeAdrenoMaintainPhysicalPages(physical,length,NativeAdrenoClean)!=kIOReturnSuccess)cleaned=false;
++            if(NativeAdrenoMaintainPhysicalPages(physical,length,write_combined?NativeAdrenoCleanInvalidate:NativeAdrenoClean)!=kIOReturnSuccess)
++                cleaned=false;
+             offset+=length;
+         }
+         if(cleaned)NativeAdrenoNotePhase(NativeAdrenoPhaseAllocate,bytes);
+@@ -201,11 +208,13 @@
+     if(status==kIOReturnSuccess) {
+         system_=true;prepared_=true;bytes_=bytes;write_combined_=write_combined;noteSystem((int64_t)bytes);
+         status=descriptor_->getLength()==NativeAdrenoRoundCpuPage(bytes)?takeSegments(descriptor_,bytes,UINT64_C(1)<<bits,false):kIOReturnUnsupported;
+-        /* Default-attribute pages may still hold the zero fill in this CPU's cache: written back before the GPU reads them. */
+-        if(status==kIOReturnSuccess && !write_combined && !cleaned) {
+-            status=maintainImported(0,bytes,NativeAdrenoClean);
++        /* Default-attribute pages may still hold the zero fill in this CPU's cache: written back before the GPU reads them. uke: also the
++         * write-combined ones (see prepareSystem), cleaned and invalidated before any client view exists. */
++        if(status==kIOReturnSuccess && !cleaned) {
++            status=maintainImported(0,bytes,write_combined?NativeAdrenoCleanInvalidate:NativeAdrenoClean);
+             NativeAdrenoNotePhase(NativeAdrenoPhaseAllocate,bytes);
+         }
++        if(status==kIOReturnSuccess && write_combined) {native_uke_wc_zero_fill[0]=native_uke_wc_zero_fill[0]+1;native_uke_wc_zero_fill[1]=native_uke_wc_zero_fill[1]+(uint32_t)(bytes>>12);}
+         if(status!=kIOReturnSuccess) {write_combined_=false;(void)release();}
+     }
+     if(status!=kIOReturnSuccess) {

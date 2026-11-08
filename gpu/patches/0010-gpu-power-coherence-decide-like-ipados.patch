@@ -1,0 +1,53 @@
+--- a/package/GpuPowerProbe.cpp
++++ b/package/GpuPowerProbe.cpp
+@@ -1209,6 +1209,7 @@
+              pass ? "on" : "off");
+     return pass;
+ }
++bool gCoherenceReadUnproven;
+ void coherenceProbe(NativeAdrenoVm *vm) {
+     uint32_t *k = native_gpu_coherence;
+     unsigned wanted = 1;
+@@ -1237,8 +1238,11 @@
+         // lines) when the GPU copies S. int-150 found every line already written back once (d0/64) while both directions were right
+         // (r1024/0 w1024/1024): the precondition, not the snoop, had failed, and the whole boot ran with per-submission maintenance.
+         // So the setup repeats until the lines are seen dirty, up to eight times (attempts in the row), and only then does the GPU copy.
++        // uke: up to 32 attempts, then the copy runs anyway (iPadOS kernel 46): the precondition is a measurement, coherence a property of
++        // the SoC (M30 proved both directions, M2z never saw a dirty line in 8 attempts and ran the whole boot with per-submission
++        // maintenance of every cached BO).
+         bool dirty = false;
+-        for (unsigned attempt = 0; attempt < 8 && !st && !dirty; ++attempt) {
++        for (unsigned attempt = 0; attempt < 32 && !st && !dirty; ++attempt) {
+             gCoherenceAttempts = attempt + 1;
+             for (unsigned i = 0; i < 1024; ++i) {S[i] = 0x11110000u | i; D[i] = 0; R[i] = 0x33330000u | i; T[i] = 0x44440000u | i;}
+             st = NativeAdrenoMaintainOwnedPages(buf, kBytes, NativeAdrenoCleanInvalidate);
+@@ -1248,7 +1252,7 @@
+             if (!st && dramPage(phys[0], words)) for (unsigned i = 0; i < 1024; i += 16) k[1] += words[i] == (0x11110000u | i);
+             dirty = k[1] >= 48;
+         }
+-        if (!st && dirty) {
++        if (!st) {
+             k[0] = 4;
+             if (gpuCopyPage(kIova, kIova + 4096) && dramPage(phys[1], words)) {
+                 k[0] = 5;
+@@ -1266,7 +1270,10 @@
+             if (dramPage(phys[3], words)) for (unsigned i = 0; i < 1024; ++i) k[5] += words[i] == (0x33330000u | i);
+         }
+         (void)touch;   /* the loads are volatile; the sum only keeps them one expression */
+-        pass = k[0] == 6 && k[1] >= 48 && k[2] == 1024 && k[4] == 1024 && k[5] == 1024;
++        // Without the dirty precondition the read copy proves nothing about snooping (DRAM already held the words), so the decision then
++        // rests on the write direction, as iPadOS kernel 46 did ("on (read unproven)").
++        pass = k[0] == 6 && k[2] == 1024 && k[4] == 1024 && k[5] == 1024;
++        gCoherenceReadUnproven = pass && k[1] < 48;
+     }
+     k[6] = uint32_t(st);
+     if (handle) (void)vm->unmap(handle);
+@@ -1281,7 +1288,7 @@
+     PE_parse_boot_argn("sheng-gpu-walk", &walk, sizeof walk);
+     native_adreno_walk_coherent[0] = pass && walk && walkProbe(vm) ? 1 : 0;
+     snprintf(native_gpu_coherence_row, sizeof native_gpu_coherence_row, "H d%u/64 a%u r%u/%u w%u/%u s%x k%u -> %s", k[1], gCoherenceAttempts,
+-             k[2], k[3], k[4], k[5], k[6], k[0], pass ? "on" : "off");
++             k[2], k[3], k[4], k[5], k[6], k[0], pass ? (gCoherenceReadUnproven ? "on (read unproven)" : "on") : "off");
+ }
+ // qcom_scm_set_gpu_smmu_aperture(0): the secure world opens the CP's aperture to the GPU's context bank 0, so CP_SMMU_TABLE_UPDATE in
+ // the ring can switch the bank's page table (per-process GPU address spaces, NativeAdrenoSubmit table mode 2). Asked first whether the

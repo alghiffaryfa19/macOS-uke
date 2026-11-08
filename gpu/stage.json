@@ -156,7 +156,8 @@
   },
   "patches": [
     "0001-gpu-power-macos-kernel-imports.patch",
-    "0002-adreno740-16k-pages.patch"
+    "0002-adreno740-16k-pages.patch",
+    "0003-gpu-power-16k-io-unmap.patch"
   ],
   "firmware": {
     "gen71100_gmu.bin": {

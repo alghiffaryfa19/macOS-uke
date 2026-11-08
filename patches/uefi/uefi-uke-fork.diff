@@ -1,0 +1,116 @@
+diff --git a/Platforms/Xiaomi/ukePkg/DeviceBuild.py b/Platforms/Xiaomi/ukePkg/DeviceBuild.py
+index c6a5dbcb..e63b5c1e 100644
+--- a/Platforms/Xiaomi/ukePkg/DeviceBuild.py
++++ b/Platforms/Xiaomi/ukePkg/DeviceBuild.py
+@@ -38,7 +38,10 @@ class CommonPlatform ():
+         "Silicon/Silicium",
+         "Silicium-ACPI",
+         "Silicium-ACPI/Platforms/Xiaomi",
+-        "Silicium-ACPI/Silicon/Qualcomm"
++        "Silicium-ACPI/Silicon/Qualcomm",
++        os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))), "UniXNU", "package"),
++        os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))), "UniXNU-uke-fork", "package"),
++        os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))), "UniXNU", "drivers", "DarwinBoot"),
+     )
+ 
+ # ####################################################################################### #
+diff --git a/Platforms/Xiaomi/ukePkg/Drivers/UkeBootMemoryDxe/UkeBootMemoryDxe.c b/Platforms/Xiaomi/ukePkg/Drivers/UkeBootMemoryDxe/UkeBootMemoryDxe.c
+index d64ccfcd..a34baa08 100644
+--- a/Platforms/Xiaomi/ukePkg/Drivers/UkeBootMemoryDxe/UkeBootMemoryDxe.c
++++ b/Platforms/Xiaomi/ukePkg/Drivers/UkeBootMemoryDxe/UkeBootMemoryDxe.c
+@@ -220,6 +220,69 @@ AddMemory (
+     return;
+   }
+ 
++  //
++  // MemoryMapLib declares the high banks statically from a 12 GB unit's DT (one 9 GiB run up to 0xB00000000).
++  // On a unit whose live DT has less DRAM there, or reserves part of it, those pages fault when touched (a
++  // DarwinBoot file read at 0xAFD229000 took a synchronous external abort). Fence every free page of that
++  // static system memory that the live DT does not describe as usable DRAM, so nothing allocates from it.
++  //
++  for (Other = 0; Other < MapCount; Other++) {
++    if ((Map[Other].GcdMemoryType != EfiGcdMemoryTypeSystemMemory) || (Map[Other].BaseAddress < SIZE_4GB)) {
++      continue;
++    }
++
++    Pieces[0].Base = Map[Other].BaseAddress;
++    Pieces[0].End  = Map[Other].BaseAddress + Map[Other].Length;
++    PieceCount     = 1;
++    for (Index = 0; Index < BankCount; Index++) {
++      PieceCount = Subtract (Pieces, PieceCount, Banks[Index]);
++    }
++
++    for (Index = 0; Index < ReservedCount; Index++) {
++      if (ReservedRanges[Index].End > Map[Other].BaseAddress) {
++        RANGE  Cut[MAX_RANGES];
++        UINTN  CutCount;
++
++        Cut[0]   = ReservedRanges[Index];
++        CutCount = 1;
++        CutCount = Subtract (Cut, CutCount, (RANGE){ 0, Map[Other].BaseAddress });
++        CutCount = Subtract (Cut, CutCount, (RANGE){ Map[Other].BaseAddress + Map[Other].Length, MAX_UINT64 });
++        if ((CutCount == 1) && (PieceCount < MAX_RANGES)) {
++          Pieces[PieceCount++] = Cut[0];
++        }
++      }
++    }
++
++    for (Index = 0; Index < PieceCount; Index++) {
++      UINT64  Chunk = Pieces[Index].Base & ~((UINT64)EFI_PAGE_SIZE - 1);
++      UINT64  Fenced = 0;
++
++      // Whole 2 MiB chunks where they are free, page by page only where something already holds part of one.
++      while (Chunk < Pieces[Index].End) {
++        UINT64                ChunkEnd = MIN (ALIGN_VALUE (Chunk + 1, SIZE_2MB), Pieces[Index].End);
++        EFI_PHYSICAL_ADDRESS  Address  = Chunk;
++        UINT64                Page;
++
++        if (!EFI_ERROR (gBS->AllocatePages (AllocateAddress, EfiReservedMemoryType,
++                                            EFI_SIZE_TO_PAGES (ChunkEnd - Chunk), &Address))) {
++          Fenced += ChunkEnd - Chunk;
++        } else {
++          for (Page = Chunk; Page < ChunkEnd; Page += EFI_PAGE_SIZE) {
++            Address = Page;
++            if (!EFI_ERROR (gBS->AllocatePages (AllocateAddress, EfiReservedMemoryType, 1, &Address))) {
++              Fenced += EFI_PAGE_SIZE;
++            }
++          }
++        }
++
++        Chunk = ChunkEnd;
++      }
++
++      DEBUG ((DEBUG_ERROR, "UKEMEM: fenced 0x%lx bytes of 0x%lx-0x%lx (not usable DRAM in the live DT)\n",
++              Fenced, Pieces[Index].Base, Pieces[Index].End));
++    }
++  }
++
+   //
+   // Holes: DRAM the GCD does not know yet.
+   //
+diff --git a/Platforms/Xiaomi/ukePkg/Drivers/UkeBootMemoryDxe/UkeBootMemoryDxe.inf b/Platforms/Xiaomi/ukePkg/Drivers/UkeBootMemoryDxe/UkeBootMemoryDxe.inf
+index cef4bbe4..887ce65f 100644
+--- a/Platforms/Xiaomi/ukePkg/Drivers/UkeBootMemoryDxe/UkeBootMemoryDxe.inf
++++ b/Platforms/Xiaomi/ukePkg/Drivers/UkeBootMemoryDxe/UkeBootMemoryDxe.inf
+@@ -14,6 +14,7 @@
+   MdeModulePkg/MdeModulePkg.dec
+   SiliciumPkg/SiliciumPkg.dec
+   UniXNUPkg/UniXNUPkg.dec
++  ukePkg/uke.dec
+ 
+ [LibraryClasses]
+   BaseLib
+diff --git a/Platforms/Xiaomi/ukePkg/uke.dec b/Platforms/Xiaomi/ukePkg/uke.dec
+index 91244628..bff9ae4b 100644
+--- a/Platforms/Xiaomi/ukePkg/uke.dec
++++ b/Platforms/Xiaomi/ukePkg/uke.dec
+@@ -8,3 +8,9 @@
+   PACKAGE_NAME      = ukePkg
+   PACKAGE_GUID      = 7E3A5B2C-4D6F-4A8B-9C1D-2E3F4A5B6C7F
+   PACKAGE_VERSION   = 0.1
++
++[Includes]
++  Include
++
++[Guids]
++  gUkeMemStatusGuid = { 0x7e3a5b2c, 0x4d6f, 0x4a8b, { 0x9c, 0x1d, 0x2e, 0x3f, 0x4a, 0x5b, 0x6c, 0x80 } }

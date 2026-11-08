@@ -1,0 +1,63 @@
+--- a/NativeGOPDisplay.cpp
++++ b/NativeGOPDisplay.cpp
+@@ -22,6 +22,14 @@
+ #include <libkern/c++/OSString.h>
+ 
+ extern "C" task_t kernel_task;
++#if defined(UKE_GOP_GPU_HANDOFF)
++// uke: the GPU scanout hand-off (boot/macos-gpu/src/macos/UkeGopHandoff.cpp, boot-arg sheng-fb-gpu=1): WindowServer's Adreno plugin
++// copies each frame into the scanout with the GPU (doubling it with native-gop-scale=2); a refused, failed or late offer is copied here.
++extern "C" void uke_gop_gpu_init(uint64_t physical, uint64_t width, uint64_t height, uint64_t rowBytes);
++extern "C" int uke_gop_gpu_present(IOMemoryDescriptor *memory, uint64_t stride, uint32_t width, uint32_t height, uint32_t format,
++                                   uint32_t timeoutMs);
++extern "C" volatile uint64_t uke_gop_gpu_stats[8];
++#endif
+ 
+ // IOMobileFramebufferLegacy (instance 0x1af8)
+ static constexpr size_t kCurrentSwap = 6032;       // the swap being programmed (swap_begin_gated 0x...dba5c, clean_queue_gated)
+@@ -220,6 +228,9 @@
+         return false;
+     }
+     fScanout = reinterpret_cast<uint8_t *>(fScanoutMap->getVirtualAddress());
++#if defined(UKE_GOP_GPU_HANDOFF)
++    uke_gop_gpu_init(fVideo.v_baseAddr & ~3UL, fVideo.v_width, fVideo.v_height, fVideo.v_rowBytes);
++#endif
+     IOLog("NativeGOPDisplay: scanout %#lx %lux%lu row %lu\n", fVideo.v_baseAddr, fVideo.v_width, fVideo.v_height, fVideo.v_rowBytes);
+     if (!IOMobileFramebufferLegacy::start(provider)) {
+         IOLog("NativeGOPDisplay: IOMobileFramebufferLegacy::start failed\n");
+@@ -325,6 +336,10 @@
+         fReported = fSubmitted + fFrames + fDropped + fStalled;
+         IOLog("NativeGOPDisplay: %llu swaps submitted, %llu shown, %llu dropped, %llu ticks stalled (current %p), last frame %llu lit centre %#llx\n",
+               fSubmitted, fFrames, fDropped, fStalled, at<IOMFBSwapIORequest *>(this, kCurrentSwap), fLastLit, fLastCenter);
++#if defined(UKE_GOP_GPU_HANDOFF)
++        printf("NativeGOPDisplay: GPU offers %llu done %llu failed %llu late %llu refused %llu waits %llu\n", uke_gop_gpu_stats[0],
++               uke_gop_gpu_stats[1], uke_gop_gpu_stats[2], uke_gop_gpu_stats[3], uke_gop_gpu_stats[4], uke_gop_gpu_stats[5]);
++#endif
+     }
+     return fVBL->setTimeoutMS(16);
+ }
+@@ -381,8 +396,22 @@
+         fLayerShape = shape;
+         IOLog("NativeGOPDisplay: swap mask=%#x scanout layer=%d\n", mask, selected);
+     }
+-    if (selected >= 0)
+-        copySurface(surfaces[selected]);
++    if (selected >= 0) {
++        bool shown = false;
++#if defined(UKE_GOP_GPU_HANDOFF)
++        // After the first CPU frame (it takes the panel from the boot console), a plain BGRA surface at offset 0 goes to the GPU.
++        IOSurface *surface = surfaces[selected];
++        if (fFrames && __atomic_load_n(&sheng_framebuffer.owner, __ATOMIC_ACQUIRE) == SHENG_FB_GUI &&
++            ioSurfacePixelFormat(surface) == 'BGRA' && !ioSurfaceBaseOffset(surface) && ioSurfaceMemory(surface)) {
++            shown = uke_gop_gpu_present(ioSurfaceMemory(surface), ioSurfaceBytesPerRow(surface),
++                                        static_cast<uint32_t>(ioSurfaceWidth(surface)), static_cast<uint32_t>(ioSurfaceHeight(surface)),
++                                        1 /* NGP_BGRX8888 */, 50) == 0;
++            if (shown) fFrames++;
++        }
++#endif
++        if (!shown)
++            copySurface(surfaces[selected]);
++    }
+     swap_complete_gated();
+ }
+ 

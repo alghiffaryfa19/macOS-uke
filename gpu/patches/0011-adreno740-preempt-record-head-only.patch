@@ -1,0 +1,35 @@
+--- a/drivers/Adreno740/NativeAdrenoVm.cpp	2026-11-07 19:22:07
++++ b/drivers/Adreno740/NativeAdrenoVm.cpp	2026-11-07 19:22:24
+@@ -436,6 +436,21 @@
+         ArmSmmu4KInvalidateAllOwnedContext(&io_,streams_->bank,context_,budget_,&r);
+     return status?fail(status):kIOReturnSuccess;
+ }
++/* uke (2026-11-07, as Snapintosh's sparse cache ownership: maintain only what the CPU wrote): the two preemption records are 2.2 MiB each
++ * on this GPU (profile preempt_record_bytes 0x225000) and every submission cleaned and invalidated both whole: 4.4 MiB of the 4.6 MiB
++ * maintained per submission (M34-M36: 11 passes of 414 KiB average per submission, about 4.5 GiB a minute). The CPU writes only the
++ * record's first 64 bytes (NativeAdrenoPreempt::writeRecord, setRecordWptr) and reads only those (recordWord); the rest is the CP's
++ * save area, which only the GPU writes. The whole record was maintained when it was mapped, so from then on only its first page is.
++ * Boot argument uke-gpu-record-publish=1 restores the whole-record pass. */
++#include "NativeAdrenoGpuContext.h"
++#include <pexpert/pexpert.h>
++static bool preemptRecordHeadOnly(uint64_t iova,size_t bytes)
++{
++    static int whole=-1;
++    if(whole<0) {unsigned v=0;PE_parse_boot_argn("uke-gpu-record-publish",&v,sizeof v);whole=v?1:0;}
++    return !whole && bytes>4096 && (iova==GpuPreemptRecordIova || iova==GpuPreemptRecord1Iova);
++}
++extern "C" {volatile uint64_t native_uke_record_head_only;}   /* submissions' record passes cut to their first page */
+ IOReturn NativeAdrenoVm::publishMapped()
+ {
+     if(!attached_ || poisoned_)return kIOReturnNotReady;
+@@ -443,7 +458,9 @@
+         const Mapping &m=mappings_[i];
+         if(!m.memory)continue;
+         if(coherentMapping(m.writeback) || importedUntouched(m.memory)) {native_adreno_coherent_skips[2]=native_adreno_coherent_skips[2]+1;continue;}
+-        if(m.memory->publishForDevice(0,m.memory->bytes(),true,distrust_write_combined_,NativeAdrenoPhaseSubmit))return fail(ArmSmmu4KIoError);
++        const bool head=preemptRecordHeadOnly(m.iova,m.memory->bytes());
++        if(head)native_uke_record_head_only=native_uke_record_head_only+1;
++        if(m.memory->publishForDevice(0,head?4096:m.memory->bytes(),true,distrust_write_combined_,NativeAdrenoPhaseSubmit))return fail(ArmSmmu4KIoError);
+     }
+     return kIOReturnSuccess;
+ }

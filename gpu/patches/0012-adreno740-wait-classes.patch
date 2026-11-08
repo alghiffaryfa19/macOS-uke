@@ -1,0 +1,49 @@
+--- a/drivers/Adreno740/NativeAdrenoUserClient.cpp	2026-11-07 22:55:32
++++ b/drivers/Adreno740/NativeAdrenoUserClient.cpp	2026-11-07 22:58:58
+@@ -759,6 +759,9 @@
+     if(entry->metadata_bytes)memcpy(reply->text,entry->metadata,entry->metadata_bytes);
+     return kIOReturnSuccess;
+ }
++extern "C" {volatile uint64_t native_uke_wait_classes[17];volatile uint64_t native_uke_wait_procs[9][6];volatile char native_uke_wait_names[8][16];
++uint32_t native_uke_wait_claimed[8];}
++extern "C" void proc_selfname(char *,int);
+ IOReturn NativeAdrenoUserClient::waitFence(const NativeAdrenoAbiWaitFence *request,
+     const NativeAdrenoRingClock *clock)
+ {
+@@ -768,5 +771,35 @@
+     const uint32_t timeout_us=request->timeout_ns==0?0:
+         (request->timeout_ns>UINT64_C(0xffffffff)*1000u?0xffffffffu:
+         (uint32_t)(request->timeout_ns/1000));
+-    return submit_->wait((uint32_t)request->fence,clock,timeout_us);
++    /* uke (2026-11-07): half of all waits ended in timeout (M42: 9175 of 18332). Which kind: per requested timeout class (0 = a status poll,
++     * up to 1 ms, up to 20 ms, longer) the waits that completed and those that timed out, and the microseconds each class spent here, so
++     * the log tells polls from real stalls. [0..3] completed, [4..7] timed out, [8..11] us completed, [12..15] us timed out, [16] longest us. */
++    const unsigned cls=timeout_us==0?0:timeout_us<=1000?1:timeout_us<=20000?2:3;
++    const uint64_t began=clock->now_us?clock->now_us(clock->cookie):0;
++    const IOReturn status=submit_->wait((uint32_t)request->fence,clock,timeout_us);
++    const uint64_t took=clock->now_us?clock->now_us(clock->cookie)-began:0;
++    const unsigned slot=status==kIOReturnTimeout?4u:0u;
++    native_uke_wait_classes[slot+cls]=native_uke_wait_classes[slot+cls]+1;
++    native_uke_wait_classes[8+slot+cls]=native_uke_wait_classes[8+slot+cls]+took;
++    if(took>native_uke_wait_classes[16])native_uke_wait_classes[16]=took;
++    /* Who waits: the first 8 processes by name; the rest go to slot 8 ("other"). Words per slot: polls, polls timed out, waits, waits
++     * timed out, us in waits, longest us. Diagnostic only: concurrent updates may lose a count. */
++    {
++        char name[16]={};proc_selfname(name,sizeof name);
++        unsigned at=8;
++        for(unsigned i=0;i<8;++i) {
++            if(native_uke_wait_names[i][0] && !strncmp((const char *)native_uke_wait_names[i],name,sizeof name)) {at=i;break;}
++            if(!native_uke_wait_names[i][0]) {
++                uint32_t expected=0;
++                if(__atomic_compare_exchange_n(&native_uke_wait_claimed[i],&expected,1u,false,__ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE)) {
++                    memcpy((void *)native_uke_wait_names[i],name,sizeof name);at=i;break;
++                }
++            }
++        }
++        volatile uint64_t *w=native_uke_wait_procs[at];
++        const bool poll=timeout_us==0,out=status==kIOReturnTimeout;
++        if(poll) {w[0]=w[0]+1;if(out)w[1]=w[1]+1;}
++        else {w[2]=w[2]+1;if(out)w[3]=w[3]+1;w[4]=w[4]+took;if(took>w[5])w[5]=took;}
++    }
++    return status;
+ }

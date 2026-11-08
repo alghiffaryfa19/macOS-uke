@@ -68,7 +68,7 @@ echo "6/6 enlace GPUBundles y fstab de UKEDRV"
 mkdir -p $T/data/Library/GPUBundles
 ln -sfn /Volumes/UKEDRV/NativeAdrenoMetal.bundle $T/data/Library/GPUBundles/NativeAdrenoMetal.bundle
 mkdir -p $T/data/private/etc
-grep -qs UKEDRV $T/data/private/etc/fstab || echo "LABEL=UKEDRV /Volumes/UKEDRV hfs ro,nobrowse" >> $T/data/private/etc/fstab
+grep -qs UKEDRV $T/data/private/etc/fstab || echo "LABEL=UKEDRV /Volumes/UKEDRV apfs ro,nobrowse" >> $T/data/private/etc/fstab
 chown root:wheel $T/data/private/etc/fstab; chmod 644 $T/data/private/etc/fstab
 ls -la $T/data/Users $T/data/Library/GPUBundles
 du -sh $T/sys/System/Library/dyld $T/preboot/Cryptexes/OS

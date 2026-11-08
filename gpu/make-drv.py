@@ -5,12 +5,12 @@ the 25 GB system. NativeUfs publishes it as a read-only disk (forsheng/nativeufs
 firmware table at drv.json "firmware_offset" through native_ufs_drv_read.
 
 Layout of the window (drv.json):
-  0 .. volume_bytes              HFS+ volume "UKEDRV" without a partition map (macOS mounts the whole disk)
+  0 .. volume_bytes              GPT + APFS container with volume "UKEDRV" (from 1 MiB; the boot kernel has no HFS)
   firmware_offset (last 1 MiB)   table "UKEFW001" {u32 count, u32 0, {name[32], u64 offset, u64 bytes, sha256}[8]},
                                  then each image 4 KiB aligned; offsets are from the start of the window
 
 Commands:
-  image STAGING OUT      HFS+ volume from the folder STAGING plus the gen71100 firmware area -> OUT (512 MiB)
+  image STAGING OUT      APFS volume from the folder STAGING plus the gen71100 firmware area -> OUT (512 MiB)
   manifest OUT [without-drv]
                          SHNGROOT header (4 KiB) for userdata with OS, ISC and DRV, from ipsw/macos26/fullos/full-root.json;
                          without-drv rebuilds today's two-window header (the rollback: an unpatched NativeUfs refuses three)
@@ -24,6 +24,8 @@ import json
 import os
 import runpy
 import struct
+import uuid
+import zlib
 import subprocess
 import sys
 from pathlib import Path
@@ -66,25 +68,68 @@ def firmware_area():
     return bytes(area)
 
 
+APFS_TYPE = uuid.UUID('7c3457ef-0000-11aa-aa11-00306543ecac')
+
+
+def gpt(container_bytes):
+    """Protective MBR + GPT for the whole 512 MiB window, one APFS partition from 1 MiB over the container; the backup
+    entries and header sit in the window's last 33 sectors, after the firmware images (the kernel only probes APFS
+    inside a partition of the APFS type, as the OS and ISC windows are wrapped)."""
+    sectors = DRV['bytes'] // 512
+    first, last = MIB // 512, (MIB + container_bytes) // 512 - 1
+    ident = lambda tag: uuid.uuid5(uuid.NAMESPACE_URL, 'uke://drv/' + tag).bytes_le
+    entries = bytearray(16384)
+    struct.pack_into('<16s16sQQQ72s', entries, 0, APFS_TYPE.bytes_le, ident('partition'), first, last, 0,
+                     DRV['volume_name'].encode('utf-16le'))
+    crc = zlib.crc32(entries)
+
+    def header(current, other, table):
+        block = bytearray(512)
+        struct.pack_into('<8sIIIIQQQQ16sQIII', block, 0, b'EFI PART', 0x10000, 92, 0, 0, current, other,
+                         34, sectors - 34, ident('disk'), table, 128, 128, crc)
+        struct.pack_into('<I', block, 16, zlib.crc32(block[:92]))
+        return bytes(block)
+
+    head = bytearray(MIB)
+    struct.pack_into('<B3sB3sII', head, 446, 0, b'\x00\x02\x00', 0xee, b'\xff\xff\xff', 1, sectors - 1)
+    head[510:512] = b'\x55\xaa'
+    head[512:1024] = header(1, sectors - 1, 2)
+    head[1024:1024 + len(entries)] = entries
+    tail = bytes(entries) + header(sectors - 1, 1, sectors - 33)
+    return bytes(head), tail
+
+
 def image(staging, out):
+    """APFS volume UKEDRV (the boot kernel has APFS but no HFS) in a GPT, plus the firmware area."""
     check_contract()
     staging, out = Path(staging), Path(out)
-    tmp = out.with_name(out.name + '.hfs')
+    tmp = out.with_name(out.name + '.apfs')
     for leftover in (tmp, tmp.with_name(tmp.name + '.cdr')):
         leftover.unlink(missing_ok=True)
-    subprocess.run(['hdiutil', 'create', '-quiet', '-srcfolder', str(staging), '-fs', 'HFS+', '-volname',
+    container_bytes = DRV['volume_bytes'] - MIB
+    subprocess.run(['hdiutil', 'create', '-quiet', '-srcfolder', str(staging), '-fs', 'APFS', '-volname',
                     DRV['volume_name'], '-layout', 'NONE', '-format', 'UDTO',
-                    '-size', '%dm' % (DRV['volume_bytes'] // MIB), str(tmp)], check=True)
+                    '-size', '%dm' % (container_bytes // MIB), str(tmp)], check=True)
     raw = tmp.with_name(tmp.name + '.cdr')
     size = raw.stat().st_size
-    if size > DRV['volume_bytes']:
+    with open(raw, 'rb') as f:
+        f.seek(32)
+        magic = f.read(4)
+    if size > container_bytes or magic != b'NXSB':
         raw.unlink()
-        sys.exit('hdiutil made %d bytes, more than volume_bytes' % size)
-    with open(raw, 'r+b') as f:
-        f.truncate(DRV['volume_bytes'])   # zero tail, sparse on APFS
-        f.seek(DRV['volume_bytes'])
-        f.write(firmware_area())
-    raw.rename(out)
+        sys.exit('hdiutil made %d bytes (%r), not an APFS container within %d' % (size, magic, container_bytes))
+    head, tail = gpt(container_bytes)
+    with open(out, 'wb') as o:
+        o.write(head)
+        with open(raw, 'rb') as f:
+            while chunk := f.read(8 * MIB):
+                o.write(chunk)
+        o.truncate(DRV['volume_bytes'])
+        o.seek(DRV['volume_bytes'])
+        o.write(firmware_area())
+        o.seek(DRV['bytes'] - len(tail))
+        o.write(tail)
+    raw.unlink()
     verify(out)
 
 
@@ -93,21 +138,31 @@ def verify(path):
         f.seek(0, 2)
         if f.tell() != DRV['bytes']:
             sys.exit('%s is %d bytes, not %d' % (path, f.tell(), DRV['bytes']))
-        f.seek(1024)
-        if f.read(2) not in (b'H+', b'HX'):
-            sys.exit('no HFS+ volume header at 1024')
+        f.seek(512)
+        if f.read(8) != b'EFI PART':
+            sys.exit('no GPT header')
+        f.seek(DRV['bytes'] - 512)
+        if f.read(8) != b'EFI PART':
+            sys.exit('no backup GPT header')
+        f.seek(MIB + 32)
+        if f.read(4) != b'NXSB':
+            sys.exit('no APFS container at 1 MiB')
         f.seek(DRV['firmware_offset'])
         table = f.read(4096)
         if table[:8] != b'UKEFW001':
             sys.exit('no firmware table')
         count = struct.unpack_from('<I', table, 8)[0]
+        last_end = 0
         for i in range(count):
             name, offset, size, digest = ENTRY.unpack_from(table, 16 + i * ENTRY.size)
             f.seek(offset)
             if hashlib.sha256(f.read(size)).digest() != digest:
                 sys.exit('%s fails its SHA-256' % name.rstrip(b'\0').decode())
+            last_end = max(last_end, offset + size)
             print('  %-4s offset %#x  %6d bytes  sha256 %s' % (name.rstrip(b'\0').decode(), offset, size, digest.hex()[:16]))
-    print('%s: DRV image ok (%d bytes, HFS+ %s, %d firmware images)' % (path, DRV['bytes'], DRV['volume_name'], count))
+        if last_end > DRV['bytes'] - 33 * 512:
+            sys.exit('firmware overlaps the backup GPT')
+    print('%s: DRV image ok (%d bytes, GPT + APFS %s, %d firmware images)' % (path, DRV['bytes'], DRV['volume_name'], count))
 
 
 def manifest(out, variant='with-drv'):

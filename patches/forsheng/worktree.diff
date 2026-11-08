@@ -1,5 +1,5 @@
 diff --git a/config/macos26-recovery-root.json b/config/macos26-recovery-root.json
-index bf11c13..b445d1d 100644
+index bf11c13..edeb970 100644
 --- a/config/macos26-recovery-root.json
 +++ b/config/macos26-recovery-root.json
 @@ -3,17 +3,17 @@
@@ -7,7 +7,7 @@ index bf11c13..b445d1d 100644
    "window": "OS",
    "bytes": 22737321984,
 -  "sha256": "2f91771a9b1034fa5f28a93c224b0912d57fcd2ca81b570e52ece3f8c3aff13f",
-+  "sha256": "7391aa6246be0f675bb3e011433fc06562f94067631d37ab01faeb596f088044",
++  "sha256": "86e89f4e9c624e1c6d93f38ab925ce451c463f78d1213531fe63d2e2c9c2b2ed",
    "volume_uuid": "47719f50-5527-44a3-9f59-8170528d8c14",
    "isc": {
      "window": "ISC",
@@ -88,6 +88,174 @@ index 4819aba..c164cdc 100644
 -}
 \ No newline at end of file
 +}
+diff --git a/config/macoslog.json b/config/macoslog.json
+index b586ca1..35f2afe 100644
+--- a/config/macoslog.json
++++ b/config/macoslog.json
+@@ -13,7 +13,7 @@
+   "filename": "SHENGLOG.BIN",
+   "file_bytes": 2097152,
+   "slot_bytes": 1048576,
+-  "snapshot_bytes": 82048,
++  "snapshot_bytes": 540800,
+   "period_ms": 2000,
+   "file_uuid": "f84556a4-4249-578c-90d2-1484122f7a56"
+ }
+diff --git a/platform/sheng/macos26/log/retained_log.h b/platform/sheng/macos26/log/retained_log.h
+index e39895c..b9eb406 100644
+--- a/platform/sheng/macos26/log/retained_log.h
++++ b/platform/sheng/macos26/log/retained_log.h
+@@ -6,7 +6,8 @@
+ #include <stdint.h>
+ 
+ #define SHENG_LOG_PREFIX 16384u
+-#define SHENG_LOG_TAIL 65536u
++/* uke: 512 KiB of tail (was 64 KiB): one boot of 15+ minutes fits whole (log M2x lost 106 KB of 188 KB). */
++#define SHENG_LOG_TAIL 524288u
+ struct sheng_log_record {
+     uint8_t magic[8];
+     uint32_t version, header_bytes, prefix_bytes, tail_bytes;
+@@ -20,10 +21,17 @@ _Static_assert(offsetof(struct sheng_log_record, prefix) == 128, "log header ABI
+ _Static_assert(offsetof(struct sheng_log_record, panic_state) == 44, "exception state ABI");
+ _Static_assert(offsetof(struct sheng_log_record, pc) == 56, "exception registers ABI");
+ _Static_assert(offsetof(struct sheng_log_record, kernel_uuid) == 112, "kernel UUID ABI");
+-struct sheng_log_record sheng_log_buffer __attribute__((aligned(16384))) = {
+-    .magic = {'S','H','N','L','O','G','0','1'}, .version = 1, .header_bytes = 128,
+-    .prefix_bytes = SHENG_LOG_PREFIX, .tail_bytes = SHENG_LOG_TAIL,
+-};
++/* uke: no initializer, so the 528 KiB record is zero-fill (bss) and not in the kernel file (an initialized one grew the kernel
++ * past the vendor_boot FAT). The header is written by sheng_log_begin (arm_init) and, should a snapshot come first, there. */
++struct sheng_log_record sheng_log_buffer __attribute__((aligned(16384)));
++static void sheng_log_header(struct sheng_log_record *r)
++{
++    if (r->version) return;
++    static const uint8_t magic[8] = {'S','H','N','L','O','G','0','1'};
++    for (unsigned i = 0; i < 8; i++) r->magic[i] = magic[i];
++    r->header_bytes = 128; r->prefix_bytes = SHENG_LOG_PREFIX; r->tail_bytes = SHENG_LOG_TAIL;
++    __atomic_store_n(&r->version, 1, __ATOMIC_RELEASE);
++}
+ volatile uint32_t sheng_bootstrap_capture_enabled = 1;
+ uint64_t sheng_bootstrap_fb_l2[2048] __attribute__((aligned(16384)));
+ uint64_t sheng_bootstrap_fb_trace_ready;
+@@ -128,6 +136,7 @@ unsigned sheng_log_snapshot_copy(void *destination, unsigned bytes)
+         sheng_log_restore_async(interrupt_state);
+         return 0;
+     }
++    sheng_log_header(r);
+     /* Copy RAM only; never issue storage commands or render while holding the writer. */
+     __builtin_memcpy(destination, r, sizeof(*r));
+     ((struct sheng_log_record *)destination)->writer = 0;
+@@ -253,6 +262,7 @@ void sheng_log_begin(uint64_t physical_base, uint64_t virtual_base, const void *
+ {
+     struct sheng_log_record *r = &sheng_log_buffer;
+     const uint32_t *mh = header;
++    sheng_log_header(r);
+     r->physical_base = physical_base + (uintptr_t)r - virtual_base;
+     r->image_va = (uintptr_t)header;
+     if (mh[0] == 0xfeedfacf && mh[4] <= 4096 && mh[5] <= 1048576) {
+diff --git a/platform/sheng/macos26/recovery/ui_policy_kernel.h b/platform/sheng/macos26/recovery/ui_policy_kernel.h
+index 249df02..f4ff8c6 100644
+--- a/platform/sheng/macos26/recovery/ui_policy_kernel.h
++++ b/platform/sheng/macos26/recovery/ui_policy_kernel.h
+@@ -12,6 +12,10 @@ extern const char *vnode_getname(struct vnode *);
+ extern void vnode_putname(const char *);
+ 
+ TUNABLE(uint32_t, sheng_recovery_ui_enabled, "sheng-recovery-ui", 0);
++// uke: uke-ui-skip=<bit mask> leaves the listed policies unapplied (bit i = policy i), so one boot argument switches a
++// single page back to Apple's code: bit 0 is WSSystemCanCompositeWithMetal's "no device" block, the one that keeps
++// WindowServer on the software compositor (Metal phase 2b on the Adreno 732).
++TUNABLE(uint32_t, uke_ui_skip_mask, "uke-ui-skip", 0);
+ volatile uint32_t sheng_recovery_ui_pages_applied;
+ volatile uint32_t sheng_recovery_ui_page_mask;
+ 
+@@ -47,6 +51,10 @@ sheng_recovery_ui_page(vm_page_t page, struct vnode *vnode, uint64_t offset, boo
+         if (offset != rule->file_offset || strcmp(name, rule->file))
+             continue;
+         vnode_putname(name);
++        if (i < 32 && (uke_ui_skip_mask & ((uint32_t)1 << i))) {
++            printf("SHENG: Recovery UI policy %zu skipped (uke-ui-skip)\n", i);
++            return;
++        }
+         // Never turn a failed signature, writable page, or production boot into an accepted image.
+         if (sheng_recovery_ui_enabled != 1 || PAGE_SIZE != SHENG_UI_PAGE_BYTES ||
+             csr_check(CSR_ALLOW_UNAUTHENTICATED_ROOT) != 0 || !original_validated ||
+diff --git a/platform/sheng/macos26/storage/macoslog_layout.h b/platform/sheng/macos26/storage/macoslog_layout.h
+index ed2360c..71a5d10 100644
+--- a/platform/sheng/macos26/storage/macoslog_layout.h
++++ b/platform/sheng/macos26/storage/macoslog_layout.h
+@@ -90,15 +90,20 @@ static inline bool mlFile(const MlFat &g, const uint8_t *fat, const uint8_t *roo
+     first = ML_FAT_FIRST + g.dataFirst + (cluster - 2) * g.clusterBlocks;
+     return first > ML_FAT_FIRST && first + 512 <= ML_FAT_FIRST + 16384;
+ }
++/* The record sheng_log_snapshot_copy fills: 128-byte header, 16 KiB boot prefix, 512 KiB tail (retained_log.h). Each bank is 256
++ * blocks: 1 header block plus the payload. */
++#define ML_SNAPSHOT_BYTES 540800u
++#define ML_SNAPSHOT_BLOCKS ((ML_SNAPSHOT_BYTES + 4095u) / 4096u)
++_Static_assert(1 + ML_SNAPSHOT_BLOCKS <= 256, "snapshot fits a bank");
+ static inline bool mlGuard(const uint8_t *p, uint64_t first, const uint8_t *fileId, const uint8_t *partitionId) {
+     return !memcmp(p, "SHNGSLOT", 8) && ml32(p + 8) == 1 && ml32(p + 12) == 4096 &&
+         !memcmp(p + 16, fileId, 16) && !memcmp(p + 32, partitionId, 16) &&
+-        ml64(p + 48) == first && ml64(p + 56) == 512 && ml64(p + 64) == 82048 &&
++        ml64(p + 48) == first && ml64(p + 56) == 512 && ml64(p + 64) == ML_SNAPSHOT_BYTES &&
+         ml32(p + 4092) == mlCrc(p, 4092);
+ }
+ static inline bool mlCaptureHeader(const uint8_t *p, const uint8_t *fileId) {
+     return !memcmp(p, "SHNCAP01", 8) && ml32(p + 8) == 1 && ml32(p + 12) == 4096 &&
+-        ml64(p + 16) && ml64(p + 16) != UINT64_MAX && ml32(p + 24) == 82048 &&
++        ml64(p + 16) && ml64(p + 16) != UINT64_MAX && ml32(p + 24) == ML_SNAPSHOT_BYTES &&
+         !memcmp(p + 64, fileId, 16) && ml32(p + 4092) == mlCrc(p, 4092);
+ }
+ 
+@@ -107,11 +112,15 @@ template<class Ops>
+ static bool mlCommit(Ops &ops, uint64_t first, uint64_t generation, uint8_t *payload, uint8_t *header, const uint8_t *fileId) {
+     if (!generation || generation == UINT64_MAX) return false;
+     uint64_t at = first + (generation & 1)*256;
+-    if (!ops.write(at + 1, 21, payload) || !ops.sync()) return false;
++    for (unsigned done = 0; done < ML_SNAPSHOT_BLOCKS; done += 32) {   /* one UFS command moves at most kDataMax (32 blocks) */
++        const unsigned n = ML_SNAPSHOT_BLOCKS - done < 32 ? ML_SNAPSHOT_BLOCKS - done : 32;
++        if (!ops.write(at + 1 + done, n, payload + done*4096)) return false;
++    }
++    if (!ops.sync()) return false;
+     memset(header, 0, 4096);
+     memcpy(header, "SHNCAP01", 8); mlPut32(header + 8, 1); mlPut32(header + 12, 4096);
+-    mlPut64(header + 16, generation); mlPut32(header + 24, 82048);
+-    mlPut32(header + 28, mlCrc(payload, 82048)); memcpy(header + 32, payload + 112, 16);
++    mlPut64(header + 16, generation); mlPut32(header + 24, ML_SNAPSHOT_BYTES);
++    mlPut32(header + 28, mlCrc(payload, ML_SNAPSHOT_BYTES)); memcpy(header + 32, payload + 112, 16);
+     memcpy(header + 48, payload + 24, 16); memcpy(header + 64, fileId, 16);
+     mlPut32(header + 4092, mlCrc(header, 4092));
+     return ops.write(at, 1, header) && ops.sync();
+diff --git a/platform/sheng/macos26/storage/macoslog_worker.h b/platform/sheng/macos26/storage/macoslog_worker.h
+index 0725b4d..170a539 100644
+--- a/platform/sheng/macos26/storage/macoslog_worker.h
++++ b/platform/sheng/macos26/storage/macoslog_worker.h
+@@ -51,7 +51,7 @@ static bool mlOpen(uint8_t *scratch, uint64_t &first, uint64_t &generation) {
+ static void mlThread(void *argument, wait_result_t) {
+     const unsigned mode = static_cast<unsigned>(reinterpret_cast<uintptr_t>(argument));
+     uint8_t *scratch = static_cast<uint8_t *>(IOMallocZero(2*kDataMax));
+-    uint8_t *payload = static_cast<uint8_t *>(IOMallocZero(21*4096));
++    uint8_t *payload = static_cast<uint8_t *>(IOMallocZero(ML_SNAPSHOT_BLOCKS*4096));
+     uint64_t first = 0, generation = 0, lastTotal = UINT64_MAX, lastDropped = UINT64_MAX;
+     bool failed = !scratch || !payload;
+     native_macoslog_state = 1;
+@@ -68,7 +68,7 @@ static void mlThread(void *argument, wait_result_t) {
+     sheng_boot_log_state(native_macoslog_state, native_macoslog_error, generation);
+     while (!failed && mode == 2 && !__atomic_load_n(&mlStop, __ATOMIC_ACQUIRE)) {
+         if (!gHost.ready || gHost.poisoned) { failed = true; break; }
+-        if (sheng_log_snapshot_copy(payload, 82048) != 82048) {
++        if (sheng_log_snapshot_copy(payload, ML_SNAPSHOT_BYTES) != ML_SNAPSHOT_BYTES) {
+             __atomic_fetch_add(&native_macoslog_busy, 1, __ATOMIC_RELAXED);
+             IOSleep(20);
+             continue;
+@@ -103,7 +103,7 @@ static void mlThread(void *argument, wait_result_t) {
+         IOLog("NativeUfs: macoslog stopped phase=%u error=%08x; no write retry\n", native_macoslog_phase, native_macoslog_error);
+         sheng_boot_log_state(native_macoslog_state, native_macoslog_error, generation);
+     }
+-    if (payload) IOFree(payload, 21*4096);
++    if (payload) IOFree(payload, ML_SNAPSHOT_BLOCKS*4096);
+     if (scratch) IOFree(scratch, 2*kDataMax);
+     IOLockLock(mlLifecycleLock); mlRunning = false; IOLockWakeup(mlLifecycleLock, &mlRunning, false); IOLockUnlock(mlLifecycleLock);
+     thread_terminate(current_thread());
 diff --git a/platform/sheng/macos26/storage/recovery_root.h b/platform/sheng/macos26/storage/recovery_root.h
 index de9b31a..bac02df 100644
 --- a/platform/sheng/macos26/storage/recovery_root.h
@@ -124,7 +292,7 @@ index de9b31a..bac02df 100644
    return false;
  }
 diff --git a/scripts/build_macos26_storage.py b/scripts/build_macos26_storage.py
-index c49eb5f..4262d2b 100644
+index c49eb5f..315fa48 100644
 --- a/scripts/build_macos26_storage.py
 +++ b/scripts/build_macos26_storage.py
 @@ -3,6 +3,7 @@
@@ -135,7 +303,7 @@ index c49eb5f..4262d2b 100644
  from pathlib import Path
  import plistlib
  import subprocess
-@@ -71,6 +72,14 @@ def build(root, out, compile_record, source, run, record, env, *, transport='vir
+@@ -71,6 +72,17 @@ def build(root, out, compile_record, source, run, record, env, *, transport='vir
              recovery_prefix += (f'#define NATIVE_UFS_ISC_BYTES {isc["bytes"]}ULL\n'
                  '#define NATIVE_UFS_ISC_DIGEST {' + ','.join(str(b) for b in isc_digest) + '}\n'
                  f'#define NATIVE_UFS_ISC_UUID "{isc_uuid}"\n')
@@ -147,10 +315,13 @@ index c49eb5f..4262d2b 100644
 +                raise ValueError('requires the bounded DRV window contract')
 +            recovery_prefix += (f'#define NATIVE_UFS_DRV_BYTES {drv["bytes"]}ULL\n'
 +                                f'#define NATIVE_UFS_DRV_UUID "{str(uuid.UUID(drv["uuid"])).upper()}"\n')
++        # uke: the Adreno driver (UKE_GPU_SRC) brings UkeGopHandoff.cpp, the GPU scanout hand-off NativeGOPDisplay offers frames to.
++        if os.environ.get('UKE_GPU_SRC'):
++            recovery_prefix += '#define UKE_GOP_GPU_HANDOFF 1\n'
          recovery_prefix += f'#include "{root / "platform/sheng/macos26/storage/recovery_root.h"}"\n'
          log = json.loads((root / 'config/macoslog.json').read_text())
          validate_contract(log)
-@@ -121,7 +130,6 @@ def build(root, out, compile_record, source, run, record, env, *, transport='vir
+@@ -121,7 +133,6 @@ def build(root, out, compile_record, source, run, record, env, *, transport='vir
      run(command, directory + '-compile', record, cwd=Path(compile_record['directory']), env=env)
      objects = [str(obj)]
      # uke: the NT36532 touch panel as an absolute pointer (UKE_TOUCH_SRC = staged boot/macos-touch/src).
@@ -158,7 +329,7 @@ index c49eb5f..4262d2b 100644
      touch = os.environ.get('UKE_TOUCH_SRC') if transport == 'ufs' else None
      if touch:
          touch = Path(touch)
-@@ -154,6 +162,14 @@ def build(root, out, compile_record, source, run, record, env, *, transport='vir
+@@ -154,6 +165,14 @@ def build(root, out, compile_record, source, run, record, env, *, transport='vir
                  extra += ['-I', str(sdk / 'System/Library/Frameworks/Kernel.framework/Versions/A/Headers')]
              run(extra, directory + '-touch-' + source.stem, record, cwd=Path(compile_record['directory']), env=env)
              objects.append(str(out_obj))
@@ -173,7 +344,7 @@ index c49eb5f..4262d2b 100644
      if input_driver:
          input_object = destination / 'recovery-input/NativeRecoveryInput.o'
          input_command = [str(input_object) if arg == str(obj) else
-@@ -201,6 +217,8 @@ def build(root, out, compile_record, source, run, record, env, *, transport='vir
+@@ -201,6 +220,8 @@ def build(root, out, compile_record, source, run, record, env, *, transport='vir
              CFBundleIdentifier=bundle, IOClass='UkeTouchPointer', IOProviderClass='IOResources',
              IOResourceMatch='IOKit', IOMatchCategory='UkeTouchPointer', IOProbeScore=500)
          info['OSBundleLibraries']['com.apple.iokit.IOHIDFamily'] = '2.0.0'
@@ -200,6 +371,27 @@ index ce9dfd7..40fac68 100644
  ]
  MACHINE_PATCH = ROOT / 'platform/sheng/macos26/patches/machine-driver-declarations.patch'
  CPU_PATCH = ROOT / 'platform/sheng/macos26/patches/machine-cpu-registration.patch'
+diff --git a/scripts/decode_native_log.py b/scripts/decode_native_log.py
+index cbb1f36..5210b90 100644
+--- a/scripts/decode_native_log.py
++++ b/scripts/decode_native_log.py
+@@ -9,12 +9,14 @@ import uuid
+ 
+ HEADER = 128
+ PREFIX = 16384
+-TAIL = 65536
++TAILS = (65536, 524288)   # uke: 512 KiB tail since 2026-11-07; older logs keep 64 KiB
++TAIL = TAILS[-1]
+ SIZE = HEADER + PREFIX + TAIL
+ 
+ 
+ def decode(data: bytes, expected_uuid: str) -> tuple[bytes, dict]:
+-    if len(data) != SIZE:
++    TAIL = next((t for t in TAILS if len(data) == HEADER + PREFIX + t), None)
++    if TAIL is None:
+         raise ValueError('native log snapshot is truncated or has an unknown extent')
+     fields = struct.unpack_from('<8s4I2Q2I8Q16s', data)
+     if fields[:5] != (b'SHNLOG01', 1, HEADER, PREFIX, TAIL):
 diff --git a/scripts/native_devtree.py b/scripts/native_devtree.py
 index 0f6c689..83d5b01 100644
 --- a/scripts/native_devtree.py
@@ -232,6 +424,58 @@ index 0f6c689..83d5b01 100644
                         ('lp-sip1', struct.pack('<I', 1)))
              descendants.extend(struct.pack('<II', len(entries), 0))
              for key, value in entries:
+diff --git a/scripts/native_log_file.py b/scripts/native_log_file.py
+index 4b10d18..3605b48 100644
+--- a/scripts/native_log_file.py
++++ b/scripts/native_log_file.py
+@@ -9,7 +9,8 @@ import zlib
+ 
+ ROOT = Path(__file__).resolve().parents[1]
+ CONTRACT = json.loads((ROOT / 'config/macoslog.json').read_text())
+-BLOCK, FILE_BYTES, SLOT_BYTES, SNAPSHOT_BYTES = 4096, 2 << 20, 1 << 20, 82048
++BLOCK, FILE_BYTES, SLOT_BYTES, SNAPSHOT_BYTES = 4096, 2 << 20, 1 << 20, 540800
++SNAPSHOT_SIZES = (82048, 540800)   # uke: 512 KiB tail since 2026-11-07
+ 
+ 
+ def validate_contract(contract: dict) -> None:
+@@ -177,11 +178,11 @@ def locate(image: bytes) -> int:
+     return offset
+ 
+ 
+-def guard(first_lba: int) -> bytes:
++def guard(first_lba: int, snapshot_bytes: int = SNAPSHOT_BYTES) -> bytes:
+     data = bytearray(BLOCK)
+     struct.pack_into('<8sII16s16sQQQ', data, 0, b'SHNGSLOT', 1, BLOCK,
+         uuid.UUID(CONTRACT['file_uuid']).bytes, uuid.UUID(CONTRACT['partition_uuid']).bytes_le,
+-        first_lba, FILE_BYTES//BLOCK, SNAPSHOT_BYTES)
++        first_lba, FILE_BYTES//BLOCK, snapshot_bytes)
+     struct.pack_into('<I', data, 4092, zlib.crc32(data[:4092]))
+     return bytes(data)
+ 
+@@ -193,7 +194,7 @@ def decode(data: bytes, expected_uuid: str) -> tuple[bytes, dict]:
+     marker = data[-BLOCK:]
+     first = struct.unpack_from('<Q', marker, 48)[0]
+     if (not CONTRACT['partition_first'] < first <= CONTRACT['partition_first'] + CONTRACT['partition_blocks'] - FILE_BYTES//BLOCK
+-            or marker != guard(first)):
++            or marker not in [guard(first, size) for size in SNAPSHOT_SIZES]):
+         raise ValueError('fixed log file ownership guard differs')
+     snapshots, errors = [], []
+     for bank in range(2):
+@@ -201,12 +202,12 @@ def decode(data: bytes, expected_uuid: str) -> tuple[bytes, dict]:
+         h = data[at:at+BLOCK]
+         generation = struct.unpack_from('<Q', h, 16)[0]
+         if (h[:8] != b'SHNCAP01' or struct.unpack_from('<II', h, 8) != (1, BLOCK)
+-                or not 0 < generation < (1 << 64)-1 or struct.unpack_from('<I', h, 24)[0] != SNAPSHOT_BYTES
++                or not 0 < generation < (1 << 64)-1 or struct.unpack_from('<I', h, 24)[0] not in SNAPSHOT_SIZES
+                 or h[64:80] != uuid.UUID(CONTRACT['file_uuid']).bytes
+                 or struct.unpack_from('<I', h, 4092)[0] != zlib.crc32(h[:4092])):
+             errors.append(dict(bank=bank, reason='uncommitted or invalid header'))
+             continue
+-        raw = data[at+BLOCK:at+BLOCK+SNAPSHOT_BYTES]
++        raw = data[at+BLOCK:at+BLOCK+struct.unpack_from('<I', h, 24)[0]]
+         if (struct.unpack_from('<I', h, 28)[0] != zlib.crc32(raw) or h[32:48] != raw[112:128]
+                 or h[48:64] != raw[24:40]):
+             errors.append(dict(bank=bank, reason='payload or metadata mismatch'))
 diff --git a/scripts/native_storage_module.py b/scripts/native_storage_module.py
 index 122c882..28c8ba9 100644
 --- a/scripts/native_storage_module.py

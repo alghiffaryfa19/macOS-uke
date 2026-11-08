@@ -36,7 +36,7 @@ cp "$KERNEL" "$P/kernel.macho"
 printf '\0\0\0\0' | dd of="$P/kernel.macho" bs=1 seek=8 conv=notrunc 2>/dev/null
 
 python3 -I "$DEV/scripts/make-uke-adt.py" --output "$P/kernel.macho.adt" --dram-size 0x240000000 \
-  --dram-base 0x8C0000000 --owned-memory-size 0x130000000 --chip-id 207 \
+  --dram-base 0x8C0000000 --owned-memory-size ${OWNED_MEM:-0x130000000} --chip-id 207 \
   --cpu-regs $CPU_REGS --os-environment $OS_ENV --root-match-volume-uuid $ROOT_UUID \
   --unique-chip-id "$(tr -d ' \n' < "$D/boot/chip-id.txt")" ${TRUSTCACHE:+--trust-cache}
 "$FS/.venv/bin/python" - "$P/kernel.macho.adt" "$D/ipsw/macos26/basesystem.root_hash.bin" $ROOT_UUID "${GOP:-0}" "${FULL:-0}" <<'EOF'
